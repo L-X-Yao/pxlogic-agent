@@ -102,6 +102,7 @@ class FakeDeviceTest(unittest.TestCase):
         self.assertEqual(ch0["channel"], 0)
         self.assertAlmostEqual(ch0["freq_hz"], 400.0)
         self.assertAlmostEqual(ch0["duty_pct"], 25.0)
+        self.assertAlmostEqual(ch0["high_us"], 625.0)
         self.assertIn("samples @", err)  # progress logs went to stderr
 
     def test_trigger_timeout_sends_stop(self):

@@ -7,6 +7,7 @@ No hardware or pxlobster binary is needed. Run from the repo root:
 
 import contextlib
 import io
+import json
 import os
 import sys
 import unittest
@@ -28,20 +29,38 @@ def pack(channels):
     return out
 
 
-def uart_wave(data, baud, sample_rate, gap_bits=2.0):
-    """8N1, LSB first, idle high. Bit edges fall on fractional sample times."""
-    segs = [(3.0, 1)]
-    for byte in data:
+def uart_signal(data, baud, sample_rate, gap_bits=2.0, data_bits=8, parity="none",
+                stop_bits=1, invert=False, bad_parity=(), bad_stop=()):
+    """LSB first, idle high unless invert. Bit edges fall on fractional sample times.
+
+    bad_parity / bad_stop: indices of frames sent with a flipped parity bit or
+    a low stop bit. Returns (wave, first sample of each start bit).
+    """
+    segs, start_segs = [(3.0, 1)], []
+    for n, byte in enumerate(data):
+        start_segs.append(len(segs))
         segs.append((1.0, 0))
-        segs += [(1.0, (byte >> i) & 1) for i in range(8)]
-        segs.append((1.0, 1))
+        bits = [(byte >> i) & 1 for i in range(data_bits)]
+        segs += [(1.0, b) for b in bits]
+        if parity != "none":
+            p = sum(bits) % 2 if parity == "even" else 1 - sum(bits) % 2
+            segs.append((1.0, p ^ (n in bad_parity)))
+        segs.append((1.0, 0 if n in bad_stop else 1))
+        segs += [(1.0, 1)] * (stop_bits - 1)
         if gap_bits:
             segs.append((gap_bits, 1))
     segs.append((3.0, 1))
     ends = np.cumsum([d for d, _ in segs]) * (sample_rate / baud)
     levels = np.array([v for _, v in segs], dtype=np.uint32)
+    if invert:
+        levels ^= 1
     t = np.arange(int(ends[-1]))
-    return levels[np.searchsorted(ends, t, side="right")]
+    starts = [int(np.ceil(ends[k - 1])) for k in start_segs]
+    return levels[np.searchsorted(ends, t, side="right")], starts
+
+
+def uart_wave(data, baud, sample_rate, gap_bits=2.0, **options):
+    return uart_signal(data, baud, sample_rate, gap_bits, **options)[0]
 
 
 def spi_wave(frames, mode, half=6):
@@ -135,6 +154,61 @@ class UartTest(unittest.TestCase):
         wave = uart_wave(self.DATA, 1_000_000, 20_000_000, gap_bits=0.5)
         self.assertEqual(self.decode(wave, 1_000_000, 20_000_000), self.DATA)
 
+    def test_glitch_is_not_a_start_bit(self):
+        line = np.ones(5_000, dtype=np.uint32)
+        line[1_000] = 0  # one-sample spike on an idle line
+        self.assertEqual(self.decode(line, 115_200, 10_000_000), b"")
+
+
+class UartOptionsTest(unittest.TestCase):
+    RATE = 10_000_000
+
+    def decode(self, wave, baud, **options):
+        return decode_uart(pack({5: wave}), channel=5, baudrate=baud,
+                           sample_rate=self.RATE, **options)
+
+    def test_sbus_inverted_8e2_back_to_back(self):
+        data = bytes([0x0F] + list(range(1, 23)) + [0x00, 0x00])  # one 25-byte SBUS frame
+        sbus = {"parity": "even", "stop_bits": 2, "invert": True}
+        wave = uart_wave(data, 100_000, self.RATE, gap_bits=0, **sbus)
+        frames = self.decode(wave, 100_000, detail=True, **sbus)
+        self.assertEqual(bytes(f["value"] for f in frames), data)
+        self.assertFalse(any(f["framing_error"] or f["parity_error"] for f in frames))
+
+    def test_7_data_bits_odd_parity(self):
+        data = b"PX Logic"
+        wave = uart_wave(data, 115_200, self.RATE, data_bits=7, parity="odd")
+        self.assertEqual(bytes(self.decode(wave, 115_200, data_bits=7, parity="odd")), data)
+
+    def test_two_stop_bits_back_to_back_with_transmitter_2pct_fast(self):
+        data = b"\x00\xff\x55\xaa"
+        wave = uart_wave(data, 115_200 * 1.02, self.RATE, gap_bits=0, stop_bits=2)
+        self.assertEqual(bytes(self.decode(wave, 115_200, stop_bits=2)), data)
+
+    def test_parity_and_framing_errors_are_flagged(self):
+        data = b"\x01\x02\x03"
+        wave = uart_wave(data, 115_200, self.RATE, parity="even", bad_parity={1}, bad_stop={2})
+        frames = self.decode(wave, 115_200, parity="even", detail=True)
+        self.assertEqual([f["value"] for f in frames], list(data))
+        self.assertEqual([f["parity_error"] for f in frames], [False, True, False])
+        self.assertEqual([f["framing_error"] for f in frames], [False, False, True])
+
+    def test_detail_positions_and_times(self):
+        wave, starts = uart_signal(b"abc", 115_200, self.RATE)
+        frames = self.decode(wave, 115_200, detail=True)
+        self.assertEqual([f["start"] for f in frames], starts)
+        span = int(self.RATE / 115_200 * 10)
+        for f in frames:
+            self.assertEqual(f["end"], f["start"] + span)
+            self.assertAlmostEqual(f["time_s"], f["start"] / self.RATE)
+        json.dumps(frames)  # plain Python types only
+
+    def test_invalid_options(self):
+        wave = uart_wave(b"x", 115_200, self.RATE)
+        for options in ({"parity": "mark"}, {"stop_bits": 1.5}, {"data_bits": 4}):
+            with self.subTest(**options), self.assertRaises(ValueError):
+                self.decode(wave, 115_200, **options)
+
 
 class SpiTest(unittest.TestCase):
     FRAMES = [[(0xA5, 0x3C), (0x00, 0xFF)], [(0x81, 0x7E)]]
@@ -153,6 +227,21 @@ class SpiTest(unittest.TestCase):
         sclk, mosi, miso, _ = spi_wave(self.FRAMES, 0)
         samples = pack({2: sclk, 3: mosi, 4: miso})
         self.assertEqual(decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4), self.EXPECTED)
+
+    def test_detail_positions_and_times(self):
+        sclk, mosi, miso, cs = spi_wave(self.FRAMES, 0)
+        samples = pack({2: sclk, 3: mosi, 4: miso, 5: cs})
+        words = decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5,
+                           sample_rate=1_000_000, detail=True)
+        self.assertEqual([(w["mosi"], w["miso"]) for w in words], self.EXPECTED)
+        # mode 0, 12 samples per bit: the first rising edge follows 24 idle,
+        # 6 CS-setup and 6 low samples; a word spans 7 bits between edges
+        self.assertEqual([(w["start"], w["end"]) for w in words],
+                         [(36, 120), (132, 216), (264, 348)])
+        self.assertAlmostEqual(words[0]["time_s"], 36e-6)
+        json.dumps(words)  # plain Python types only
+        no_rate = decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, detail=True)
+        self.assertIsNone(no_rate[0]["time_s"])
 
 
 class I2cTest(unittest.TestCase):
@@ -178,6 +267,21 @@ class I2cTest(unittest.TestCase):
             (0x50, "W", [0x01], [True, True]),
             (0x51, "W", [0x02, 0x03], [True, True, True]),
         ])
+
+    def test_detail_positions_and_times(self):
+        scl, sda = i2c_wave([[(0x68, "W", [0x75]), (0x68, "R", [0x71, 0x00])]])
+        write, read = decode_i2c(pack({0: sda, 1: scl}), sda_ch=0, scl_ch=1,
+                                 sample_rate=1_000_000, detail=True)
+        # START after 32 idle samples; each bit takes 16 samples
+        self.assertEqual((write["start"], write["end"]), (32, 344))
+        self.assertEqual((read["start"], read["end"]), (344, 800))  # repeated START, then STOP
+        self.assertAlmostEqual(write["time_s"], 32e-6)
+        json.dumps([write, read])  # plain Python types only
+
+    def test_plain_result_has_no_positions(self):
+        scl, sda = i2c_wave([[(0x3C, "W", [0x00])]])
+        [txn] = decode_i2c(pack({0: sda, 1: scl}), sda_ch=0, scl_ch=1)
+        self.assertEqual(set(txn), {"addr", "rw", "data", "acks"})
 
 
 class AnalysisTest(unittest.TestCase):
@@ -208,6 +312,26 @@ class AnalysisTest(unittest.TestCase):
         self.assertAlmostEqual(m["duty_pct"], 25.0, places=6)
         self.assertAlmostEqual(m["jitter_pct"], 0.0, places=6)
         self.assertEqual(m["edges"], 39)  # 20 falling + 19 rising
+        # the capture starts inside a pulse, so 19 complete pulses remain
+        self.assertEqual((m["high_us"], m["high_min_us"], m["high_max_us"]), (625.0, 625.0, 625.0))
+
+    def test_servo_pulse_widths(self):
+        rate = 1_000_000  # 1 us resolution
+        pulses = [np.r_[np.ones(w), np.zeros(20_000 - w)] for w in (1_000, 1_500, 2_000) * 2]
+        sig = np.concatenate([np.zeros(100)] + pulses)  # 50 Hz; starts low, so all pulses count
+        m = self.la.measure(pack({0: sig}), channel=0, sample_rate=rate)
+        self.assertAlmostEqual(m["freq_hz"], 50.0)
+        self.assertAlmostEqual(m["high_us"], 1_500.0)
+        self.assertAlmostEqual(m["high_min_us"], 1_000.0)
+        self.assertAlmostEqual(m["high_max_us"], 2_000.0)
+
+    def test_pulses_cut_off_by_the_capture_are_ignored(self):
+        cut = np.r_[np.ones(300), np.zeros(700)]
+        m = self.la.measure(pack({0: cut}), channel=0, sample_rate=1_000_000)
+        self.assertEqual(m["high_us"], 0.0)
+        sig = np.r_[cut, np.ones(500), np.zeros(500), np.ones(200)]
+        m = self.la.measure(pack({0: sig}), channel=0, sample_rate=1_000_000)
+        self.assertEqual((m["high_us"], m["high_min_us"], m["high_max_us"]), (500.0, 500.0, 500.0))
 
     def test_summary_returns_only_active_channels(self):
         rate = 1_000_000

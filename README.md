@@ -110,8 +110,11 @@ pxlogic-agent --json --rate 20e6 --time 200
 
 ```json
 {"ok": true, "sample_rate": 20000000, "duration_ms": 200, "samples": 4000000,
- "active_channels": [{"channel": 0, "freq_hz": 400.0, "duty_pct": 25.0, "jitter_pct": 0.01, "edges": 160}]}
+ "active_channels": [{"channel": 0, "freq_hz": 400.0, "duty_pct": 25.0, "jitter_pct": 0.01, "edges": 160,
+                      "high_us": 625.0, "high_min_us": 624.95, "high_max_us": 625.05}]}
 ```
+
+`high_us`、`high_min_us`、`high_max_us` 是高电平脉宽的平均、最小、最大值（µs），被采集边界截断的脉冲不计入，分辨率是一个采样周期。测舵机、电调 PWM 看这三项。
 
 失败时输出 `{"ok": false, "error": "..."}`。
 
@@ -136,10 +139,15 @@ la.devices()                  # [{"usb_id": "16c0:05dc", "label": "PX-Logic U2 c
 
 rate = la.nearest_rate(20e6)  # capture() 会取最近的支持采样率，分析时要用同一个值
 data = la.capture(rate=rate, duration_ms=100)   # numpy uint32 数组，bit N = 通道 N
-m = la.measure(data, channel=0, sample_rate=rate)   # {"channel", "freq_hz", "duty_pct", "jitter_pct", "edges"}
+m = la.measure(data, channel=0, sample_rate=rate)   # 键同上文 JSON 里 active_channels 的元素
 active = la.summary(data, sample_rate=rate)         # 打印并返回各活动通道的 measure() 结果
 
 print(bytes(decode_uart(data, channel=5, baudrate=115200, sample_rate=rate)))
+
+# SBUS：反相、100000 波特、8E2；detail=True 时每帧带采样序号、时间和错误标志
+for f in decode_uart(data, channel=6, baudrate=100_000, sample_rate=rate,
+                     parity="even", stop_bits=2, invert=True, detail=True):
+    print(f"{f['time_s']:.6f} s  0x{f['value']:02X}  framing={f['framing_error']}  parity={f['parity_error']}")
 
 for t in decode_i2c(data, sda_ch=0, scl_ch=1):
     print(f"I2C {t['rw']} 0x{t['addr']:02X}: {[hex(b) for b in t['data']]}")
@@ -148,6 +156,8 @@ pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=
 ```
 
 `capture()` 还接受 `mode`（`"buffer"` / `"stream"` / `"loop"`）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）和 `timeout_s`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
+
+三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
 
 ### 直接调用 pxlobster
 
@@ -188,7 +198,7 @@ USB 2.0 连接下，高采样率受带宽限制。
 
 | 函数 | 支持 | 限制 |
 |---|---|---|
-| `decode_uart` | 8N1，LSB 先发，空闲高电平 | 不检查停止位，不支持校验位 |
+| `decode_uart` | 5–9 位数据，无 / 奇 / 偶校验，1 或 2 个停止位，LSB 先发；`invert=True` 用于空闲低电平的线路（如 SBUS）；起始位中点复核，滤掉毛刺 | 不支持 1.5 个停止位；错误标志只在 `detail=True` 时返回 |
 | `decode_spi` | 模式 0–3，MSB 先发，CS 低有效 | 按 8 位分帧 |
 | `decode_i2c` | 7 位地址，重复起始，记录 ACK/NACK | 不支持 10 位地址 |
 

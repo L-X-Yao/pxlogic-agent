@@ -174,23 +174,40 @@ class LogicAnalyzer:
         """Stats of one channel as a dict.
 
         Keys: channel, freq_hz (0.0 with fewer than two rising edges),
-        duty_pct, jitter_pct (std of the period as % of its mean), edges.
+        duty_pct, jitter_pct (std of the period as % of its mean), edges,
+        high_us, high_min_us and high_max_us (mean, shortest and longest
+        complete high pulse in microseconds, 0.0 without one; resolution is
+        one sample period).
         """
         sig = self.channel_bits(samples, channel)
         diff = np.diff(sig.astype(np.int8))
         rising = np.flatnonzero(diff == 1)
+        falling = np.flatnonzero(diff == -1)
         stats = {
             "channel": channel,
             "freq_hz": 0.0,
             "duty_pct": float(np.mean(sig) * 100) if len(sig) else 0.0,
             "jitter_pct": 0.0,
             "edges": int(np.count_nonzero(diff)),
+            "high_us": 0.0,
+            "high_min_us": 0.0,
+            "high_max_us": 0.0,
         }
         if len(rising) >= 2:
             periods = np.diff(rising)
             period = float(np.mean(periods))
             stats["freq_hz"] = sample_rate / period
             stats["jitter_pct"] = float(np.std(periods) / period * 100)
+        if len(rising):
+            # a high pulse runs from a rising edge to the next falling edge;
+            # pulses cut off at either end of the capture are left out
+            falling = falling[falling > rising[0]]
+            n = min(len(rising), len(falling))
+            if n:
+                widths = (falling[:n] - rising[:n]) * (1e6 / sample_rate)
+                stats["high_us"] = float(widths.mean())
+                stats["high_min_us"] = float(widths.min())
+                stats["high_max_us"] = float(widths.max())
         return stats
 
     def measure_frequency(self, samples, channel=0, sample_rate=20_000_000):
@@ -200,7 +217,7 @@ class LogicAnalyzer:
             print(f"[LA] CH{channel}: no periodic signal detected")
             return 0.0
         print(f"[LA] CH{channel}: {m['freq_hz']:,.1f} Hz, {m['duty_pct']:.1f}% duty, "
-              f"jitter {m['jitter_pct']:.2f}%")
+              f"high {m['high_us']:,.2f} us, jitter {m['jitter_pct']:.2f}%")
         return m["freq_hz"]
 
     def summary(self, samples, sample_rate=20_000_000):
@@ -210,7 +227,7 @@ class LogicAnalyzer:
             m = self.measure(samples, ch, sample_rate)
             if m["edges"] > 2:
                 print(f"  CH{ch:02d}: {m['freq_hz']:>10,.0f} Hz  {m['duty_pct']:5.1f}% duty  "
-                      f"{m['edges']:>8,} edges")
+                      f"{m['high_us']:>10,.2f} us high  {m['edges']:>8,} edges")
                 active.append(m)
         return active
 
@@ -219,53 +236,121 @@ class LogicAnalyzer:
 # Protocol decoders
 # ═══════════════════════════════════
 
-def decode_uart(samples, channel, baudrate, sample_rate):
-    """Decode UART (8N1, LSB first, idle high). Returns list of byte values."""
+def _seconds(index, sample_rate):
+    return index / sample_rate if sample_rate else None
+
+
+def decode_uart(samples, channel, baudrate, sample_rate, *, data_bits=8,
+                parity="none", stop_bits=1, invert=False, detail=False):
+    """Decode UART, LSB first. The defaults are 8N1 on a line that idles high.
+
+    Args:
+        data_bits: 5 to 9
+        parity: "none", "even" or "odd"
+        stop_bits: 1 or 2
+        invert: True for a line that idles low, e.g. SBUS
+            (100000 baud, parity="even", stop_bits=2)
+        detail: return one dict per frame instead of the bare value
+
+    Returns:
+        List of data values. With detail=True, dicts with keys value, start
+        and end (sample indices of the frame), time_s, framing_error (a stop
+        bit was low) and parity_error.
+    """
+    parity = str(parity).lower()
+    if parity not in ("none", "even", "odd"):
+        raise ValueError(f'parity must be "none", "even" or "odd", not {parity!r}')
+    if stop_bits not in (1, 2):
+        raise ValueError(f"stop_bits must be 1 or 2, not {stop_bits!r}")
+    if data_bits not in range(5, 10):
+        raise ValueError(f"data_bits must be 5 to 9, not {data_bits!r}")
     sig = (samples >> channel) & 1
+    if invert:
+        sig = sig ^ 1
     spb = sample_rate / baudrate
+    parity_bits = 0 if parity == "none" else 1
+    n_bits = 1 + data_bits + parity_bits + stop_bits  # start bit included
+    centre = [int(spb * (k + 0.5)) for k in range(n_bits)]  # bit centres from the start edge
+    span = int(spb * n_bits)
     result = []
     i = 0
-    while i < len(sig) - int(spb * 10):
+    while i < len(sig) - span - 1:
         if sig[i] == 1 and sig[i + 1] == 0:
-            val = 0
-            for bit in range(8):
-                # skip the start bit, sample each data bit at its centre
-                pos = int(i + 1 + spb * (bit + 1.5))
-                if pos < len(sig):
-                    val |= int(sig[pos]) << bit
-            result.append(val)
-            # resume at the stop-bit centre so back-to-back frames tolerate baud error
-            i += int(spb * 9.5)
+            start = i + 1
+            bits = [int(sig[start + c]) for c in centre]
+            if bits[0]:  # high again at the start-bit centre: a glitch, not a frame
+                i += 1
+                continue
+            data = bits[1:1 + data_bits]
+            value = sum(b << k for k, b in enumerate(data))
+            parity_error = False
+            if parity_bits:
+                expected = 1 if parity == "odd" else 0
+                parity_error = (sum(data) + bits[1 + data_bits]) % 2 != expected
+            if detail:
+                result.append({"value": value, "start": start, "end": start + span,
+                               "time_s": _seconds(start, sample_rate),
+                               "framing_error": not all(bits[-stop_bits:]),
+                               "parity_error": parity_error})
+            else:
+                result.append(value)
+            # resume at the last stop-bit centre so back-to-back frames tolerate baud error
+            i = start - 1 + centre[-1]
         else:
             i += 1
     return result
 
 
-def decode_spi(samples, sclk_ch, mosi_ch, miso_ch=None, cs_ch=None, cpol=0, cpha=0):
-    """Decode SPI. Returns list of (mosi_byte, miso_byte) tuples."""
+def decode_spi(samples, sclk_ch, mosi_ch, miso_ch=None, cs_ch=None, cpol=0, cpha=0,
+               *, sample_rate=None, detail=False):
+    """Decode SPI, MSB first, 8-bit words, CS active low.
+
+    Returns:
+        List of (mosi_byte, miso_byte) tuples. With detail=True, dicts with
+        keys mosi, miso, start and end (sample indices of the word's first
+        and last sampling edge) and time_s (None without sample_rate).
+    """
     sclk = (samples >> sclk_ch) & 1
     mosi = (samples >> mosi_ch) & 1
     miso = (samples >> miso_ch) & 1 if miso_ch is not None else np.zeros_like(mosi)
     edge = 1 if (cpol == 0) != (cpha == 1) else -1
     edges = np.where(np.diff(sclk.astype(np.int8)) == edge)[0] + 1
-    result, mo, mi, bits = [], 0, 0, 0
-    for idx in edges:
+    result, mo, mi, bits, first, last = [], 0, 0, 0, 0, 0
+
+    def flush():
+        if detail:
+            result.append({"mosi": mo, "miso": mi, "start": first, "end": last,
+                           "time_s": _seconds(first, sample_rate)})
+        else:
+            result.append((mo, mi))
+
+    for idx in edges.tolist():
         if cs_ch is not None and ((samples[idx] >> cs_ch) & 1) == 1:
             if bits:
-                result.append((mo, mi))
+                flush()
                 mo = mi = bits = 0
             continue
+        if not bits:
+            first = idx
+        last = idx
         mo = (mo << 1) | int(mosi[idx])
         mi = (mi << 1) | int(miso[idx])
         bits += 1
         if bits == 8:
-            result.append((mo, mi))
+            flush()
             mo = mi = bits = 0
     return result
 
 
-def decode_i2c(samples, sda_ch, scl_ch):
-    """Decode I2C. Returns list of transaction dicts."""
+def decode_i2c(samples, sda_ch, scl_ch, *, sample_rate=None, detail=False):
+    """Decode I2C with 7-bit addresses.
+
+    Returns:
+        List of transaction dicts with keys addr, rw, data and acks. With
+        detail=True they also have start and end (sample indices of the
+        START and of the STOP or repeated START; end is None if the capture
+        ends first) and time_s (None without sample_rate).
+    """
     sda = (samples >> sda_ch) & 1
     scl = (samples >> scl_ch) & 1
     txns, cur = [], None
@@ -273,11 +358,13 @@ def decode_i2c(samples, sda_ch, scl_ch):
     for i in range(1, len(sda)):
         if scl[i] == 1 and sda[i - 1] == 1 and sda[i] == 0:  # START
             if cur and cur['data']:
+                cur['end'] = i  # ended by a repeated START
                 txns.append(cur)
-            cur = {'addr': 0, 'rw': '?', 'data': [], 'acks': []}
+            cur = {'addr': 0, 'rw': '?', 'data': [], 'acks': [], 'start': i, 'end': None}
             bval = bcnt = 0
         elif scl[i] == 1 and sda[i - 1] == 0 and sda[i] == 1:  # STOP
             if cur:
+                cur['end'] = i
                 txns.append(cur)
                 cur = None
         elif cur is not None and scl[i - 1] == 0 and scl[i] == 1:  # SCL rising
@@ -295,6 +382,11 @@ def decode_i2c(samples, sda_ch, scl_ch):
                 bval = bcnt = 0
     if cur and cur['data']:
         txns.append(cur)
+    for t in txns:
+        if detail:
+            t['time_s'] = _seconds(t['start'], sample_rate)
+        else:
+            del t['start'], t['end']
     return txns
 
 
