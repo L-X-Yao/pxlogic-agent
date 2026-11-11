@@ -243,6 +243,15 @@ class SpiTest(unittest.TestCase):
         no_rate = decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, detail=True)
         self.assertIsNone(no_rate[0]["time_s"])
 
+    def test_capture_starting_mid_word_resyncs_at_cs_release(self):
+        sclk, mosi, miso, cs = spi_wave(self.FRAMES + [[(0x12, 0x34)]], 0)
+        cut = 24 + 6 + 3 * 12  # idle, CS setup and the first 3 bits of byte 0
+        samples = pack({2: sclk, 3: mosi, 4: miso, 5: cs})[cut:]
+        words = decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, detail=True)
+        # the cut frame is misaligned and ends in a 5-bit remainder; later frames are intact
+        self.assertEqual([(w["mosi"], w["miso"], w["bits"]) for w in words],
+                         [(0x28, 0xE7, 8), (0x00, 0x1F, 5), (0x81, 0x7E, 8), (0x12, 0x34, 8)])
+
 
 class I2cTest(unittest.TestCase):
     def decode(self, messages):
@@ -277,6 +286,24 @@ class I2cTest(unittest.TestCase):
         self.assertEqual((read["start"], read["end"]), (344, 800))  # repeated START, then STOP
         self.assertAlmostEqual(write["time_s"], 32e-6)
         json.dumps([write, read])  # plain Python types only
+
+    def test_address_only_part_before_repeated_start(self):
+        got = self.decode([[(0x50, "W", []), (0x50, "R", [0x01])]])
+        self.assertEqual(got, [
+            (0x50, "W", [], [True]),
+            (0x50, "R", [0x01], [True, False]),
+        ])
+
+    def test_capture_ending_after_the_address(self):
+        scl, sda = i2c_wave([[(0x50, "W", [0x01])]])
+        cut = 32 + 8 + 9 * 16  # idle, START, then the address byte and its ACK
+        [txn] = decode_i2c(pack({0: sda[:cut], 1: scl[:cut]}), sda_ch=0, scl_ch=1, detail=True)
+        self.assertEqual((txn["addr"], txn["rw"], txn["data"], txn["end"]), (0x50, "W", [], None))
+
+    def test_start_stop_without_a_byte_is_ignored(self):
+        scl = [1] * 40
+        sda = [1] * 10 + [0] * 10 + [1] * 20  # START at 10, STOP at 20
+        self.assertEqual(decode_i2c(pack({0: sda, 1: scl}), sda_ch=0, scl_ch=1), [])
 
     def test_plain_result_has_no_positions(self):
         scl, sda = i2c_wave([[(0x3C, "W", [0x00])]])

@@ -305,30 +305,42 @@ def decode_spi(samples, sclk_ch, mosi_ch, miso_ch=None, cs_ch=None, cpol=0, cpha
                *, sample_rate=None, detail=False):
     """Decode SPI, MSB first, 8-bit words, CS active low.
 
+    Releasing CS ends the current word, so every frame starts aligned even
+    when the capture began in the middle of a word. A word cut short this
+    way is still returned, with fewer than 8 bits.
+
     Returns:
         List of (mosi_byte, miso_byte) tuples. With detail=True, dicts with
-        keys mosi, miso, start and end (sample indices of the word's first
-        and last sampling edge) and time_s (None without sample_rate).
+        keys mosi, miso, bits (8 unless cut short), start and end (sample
+        indices of the word's first and last sampling edge) and time_s
+        (None without sample_rate).
     """
     sclk = (samples >> sclk_ch) & 1
     mosi = (samples >> mosi_ch) & 1
     miso = (samples >> miso_ch) & 1 if miso_ch is not None else np.zeros_like(mosi)
     edge = 1 if (cpol == 0) != (cpha == 1) else -1
     edges = np.where(np.diff(sclk.astype(np.int8)) == edge)[0] + 1
+    releases = []  # first high sample of each CS release
+    if cs_ch is not None:
+        cs = (samples >> cs_ch) & 1
+        releases = (np.flatnonzero(np.diff(cs.astype(np.int8)) == 1) + 1).tolist()
     result, mo, mi, bits, first, last = [], 0, 0, 0, 0, 0
 
     def flush():
         if detail:
-            result.append({"mosi": mo, "miso": mi, "start": first, "end": last,
+            result.append({"mosi": mo, "miso": mi, "bits": bits, "start": first, "end": last,
                            "time_s": _seconds(first, sample_rate)})
         else:
             result.append((mo, mi))
 
+    r = 0
     for idx in edges.tolist():
-        if cs_ch is not None and ((samples[idx] >> cs_ch) & 1) == 1:
+        while r < len(releases) and releases[r] <= idx:  # CS released since the last edge
+            r += 1
             if bits:
                 flush()
                 mo = mi = bits = 0
+        if cs_ch is not None and cs[idx] == 1:
             continue
         if not bits:
             first = idx
@@ -339,11 +351,16 @@ def decode_spi(samples, sclk_ch, mosi_ch, miso_ch=None, cs_ch=None, cpol=0, cpha
         if bits == 8:
             flush()
             mo = mi = bits = 0
+    if bits and r < len(releases):  # CS released after the last edge
+        flush()
     return result
 
 
 def decode_i2c(samples, sda_ch, scl_ch, *, sample_rate=None, detail=False):
     """Decode I2C with 7-bit addresses.
+
+    Each part from a START to the next STOP or repeated START is listed once
+    its address byte has arrived, address-only parts included.
 
     Returns:
         List of transaction dicts with keys addr, rw, data and acks. With
@@ -357,16 +374,16 @@ def decode_i2c(samples, sda_ch, scl_ch, *, sample_rate=None, detail=False):
     bval, bcnt = 0, 0
     for i in range(1, len(sda)):
         if scl[i] == 1 and sda[i - 1] == 1 and sda[i] == 0:  # START
-            if cur and cur['data']:
+            if cur and cur['rw'] != '?':
                 cur['end'] = i  # ended by a repeated START
                 txns.append(cur)
             cur = {'addr': 0, 'rw': '?', 'data': [], 'acks': [], 'start': i, 'end': None}
             bval = bcnt = 0
         elif scl[i] == 1 and sda[i - 1] == 0 and sda[i] == 1:  # STOP
-            if cur:
+            if cur and cur['rw'] != '?':
                 cur['end'] = i
                 txns.append(cur)
-                cur = None
+            cur = None
         elif cur is not None and scl[i - 1] == 0 and scl[i] == 1:  # SCL rising
             if bcnt < 8:
                 bval = (bval << 1) | int(sda[i])
@@ -380,7 +397,7 @@ def decode_i2c(samples, sda_ch, scl_ch, *, sample_rate=None, detail=False):
                     cur['data'].append(bval)
                 cur['acks'].append(ack)
                 bval = bcnt = 0
-    if cur and cur['data']:
+    if cur and cur['rw'] != '?':
         txns.append(cur)
     for t in txns:
         if detail:

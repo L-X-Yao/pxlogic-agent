@@ -157,7 +157,7 @@ pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=
 
 `capture()` 还接受 `mode`（`"buffer"` / `"stream"` / `"loop"`）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）和 `timeout_s`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
 
-三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
+三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI 还有 `bits`，小于 8 表示片选释放时不满一个字。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
 
 ### 直接调用 pxlobster
 
@@ -199,8 +199,8 @@ USB 2.0 连接下，高采样率受带宽限制。
 | 函数 | 支持 | 限制 |
 |---|---|---|
 | `decode_uart` | 5–9 位数据，无 / 奇 / 偶校验，1 或 2 个停止位，LSB 先发；`invert=True` 用于空闲低电平的线路（如 SBUS）；起始位中点复核，滤掉毛刺 | 不支持 1.5 个停止位；错误标志只在 `detail=True` 时返回 |
-| `decode_spi` | 模式 0–3，MSB 先发，CS 低有效 | 按 8 位分帧 |
-| `decode_i2c` | 7 位地址，重复起始，记录 ACK/NACK | 不支持 10 位地址 |
+| `decode_spi` | 模式 0–3，MSB 先发，CS 低有效；每次片选释放都重新对齐，从字中间开始的采集只影响第一帧 | 按 8 位分帧；不满 8 位的残字照常返回；不给 `cs_ch` 时无法重新对齐 |
+| `decode_i2c` | 7 位地址，重复起始，记录 ACK/NACK；收到地址字节的段都会列出，包括只发了地址的段 | 不支持 10 位地址 |
 
 单元测试用合成波形和一个模拟的 pxlobster，覆盖解码器和命令行，不需要硬件：
 

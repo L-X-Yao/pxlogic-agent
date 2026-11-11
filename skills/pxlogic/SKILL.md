@@ -32,7 +32,7 @@ pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=
 - 测频和解码用的 `sample_rate` 必须等于 `nearest_rate()` 取整后的值。
 - 采样率至少取被测信号最高频率的 10 倍；解 UART 时至少取波特率的 10 倍。测脉宽时分辨率是一个采样周期，舵机、电调 PWM 至少用 1 MHz。
 - 采样点数等于采样率乘时长，32 通道每点 4 字节；单次尽量不超过 5000 万点（约 200 MB）。
-- UART 支持 5–9 位数据、无 / 奇 / 偶校验、1 或 2 个停止位和反相（`invert=True`，如 SBUS）；SPI 只按 8 位分帧；I2C 只支持 7 位地址。
+- UART 支持 5–9 位数据、无 / 奇 / 偶校验、1 或 2 个停止位和反相（`invert=True`，如 SBUS）；SPI 按 8 位分帧，片选释放时重新对齐，`detail=True` 时 `bits` 小于 8 的是残字；I2C 只支持 7 位地址。
 - 需要每帧的时间，或 UART 的校验、停止位错误时，解码函数加 `detail=True`；SPI、I2C 还要传 `sample_rate` 才有 `time_s`。
 - 找不到设备时：WSL 里先确认 Windows 侧执行过 `usbipd attach --wsl --busid <BUSID>`，再用 `lsusb` 查找 `16c0:05dc` 或 `1a86:5237`。
 - 需要中止正在进行的采集时，执行 `pxlobster --stop`。
