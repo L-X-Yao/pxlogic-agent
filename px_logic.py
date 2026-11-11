@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """
-PX Logic 32 — AI-callable Python wrapper around pxlobster CLI.
+PX Logic logic-analyzer toolkit for AI agents, built on the pxlobster CLI.
 
 pxlobster handles USB/FPGA/hardware.
 This layer handles capture orchestration + signal analysis + protocol decoding.
@@ -8,11 +8,14 @@ This layer handles capture orchestration + signal analysis + protocol decoding.
 Quick start:
     from px_logic import LogicAnalyzer
     la = LogicAnalyzer()
-    la.prime()
     data = la.capture(rate=20_000_000, duration_ms=100)
-    la.measure_frequency(data, channel=0)
+    la.measure(data, channel=0, sample_rate=20_000_000)  # -> dict
+
+Command line (with --json, stdout carries exactly one JSON object):
+    pxlogic-agent --json --rate 20e6 --time 200
 """
 
+import re
 import subprocess
 import sys
 import os
@@ -22,8 +25,16 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EXE_NAME = "pxlobster.exe" if sys.platform == "win32" else "pxlobster"
+_DEVICE_LINE = re.compile(r"([0-9A-Fa-f]{4}:[0-9A-Fa-f]{4})\s+(\S.*)")
+
 
 def _find_pxlobster():
+    """Locate pxlobster: $PXLOBSTER, then next to this file, then PATH."""
+    env = os.environ.get("PXLOBSTER")
+    if env:
+        if os.path.isfile(env):
+            return env
+        raise FileNotFoundError(f"PXLOBSTER points to a missing file: {env}")
     local = os.path.join(_HERE, _EXE_NAME)
     if os.path.isfile(local):
         return local
@@ -31,7 +42,18 @@ def _find_pxlobster():
     if found:
         return found
     raise FileNotFoundError(
-        f"pxlobster not found. Place {_EXE_NAME} next to this script or add to PATH.")
+        f"pxlobster not found. Set PXLOBSTER, place {_EXE_NAME} next to px_logic.py, "
+        "or add it to PATH.")
+
+
+def _parse_devices(text):
+    """Parse pxlobster device lines such as "16C0:05DC  PX-Logic U2 channel 32"."""
+    devices = []
+    for line in text.splitlines():
+        m = _DEVICE_LINE.fullmatch(line.strip())
+        if m:
+            devices.append({"usb_id": m.group(1).lower(), "label": m.group(2).strip()})
+    return devices
 
 
 class LogicAnalyzer:
@@ -48,12 +70,17 @@ class LogicAnalyzer:
         self.exe = exe_path or _find_pxlobster()
         self.channels = channels
         self.bytes_per_sample = 4 if channels > 16 else 2
+        self.last_output = ""  # stdout of the last pxlobster call
+        self.last_error = ""   # why the last pxlobster call failed, "" on success
 
     def _run(self, args, timeout=60):
         r = subprocess.run([self.exe] + args,
                            capture_output=True, text=True, timeout=timeout)
-        if r.returncode != 0 and r.stderr.strip():
-            print(f"[LA] stderr: {r.stderr.strip()}", file=sys.stderr)
+        err = r.stderr.strip()
+        self.last_output = r.stdout
+        self.last_error = (err or f"pxlobster exited with code {r.returncode}") if r.returncode else ""
+        if self.last_error:
+            print(f"[LA] pxlobster error: {self.last_error}", file=sys.stderr)
         return r
 
     def scan(self):
@@ -61,9 +88,16 @@ class LogicAnalyzer:
         print(r.stdout.strip())
         return r.returncode == 0
 
+    def devices(self):
+        """Supported devices as [{"usb_id": "16c0:05dc", "label": "..."}]."""
+        self._run(["--scan"])
+        return _parse_devices(self.last_output)
+
     def prime(self):
+        """Load the FPGA bitstream. True only if a device reports it loaded."""
         r = self._run(["--prime-fw"], timeout=30)
-        return r.returncode == 0
+        # pxlobster exits 0 even when a device is busy or the load fails
+        return r.returncode == 0 and "[fw loaded]" in r.stdout
 
     def stop(self):
         self._run(["--stop"], timeout=5)
@@ -121,28 +155,49 @@ class LogicAnalyzer:
     def channel_bits(self, samples, channel):
         return (samples >> channel) & 1
 
+    def measure(self, samples, channel=0, sample_rate=20_000_000):
+        """Stats of one channel as a dict.
+
+        Keys: channel, freq_hz (0.0 with fewer than two rising edges),
+        duty_pct, jitter_pct (std of the period as % of its mean), edges.
+        """
+        sig = self.channel_bits(samples, channel)
+        diff = np.diff(sig.astype(np.int8))
+        rising = np.flatnonzero(diff == 1)
+        stats = {
+            "channel": channel,
+            "freq_hz": 0.0,
+            "duty_pct": float(np.mean(sig) * 100) if len(sig) else 0.0,
+            "jitter_pct": 0.0,
+            "edges": int(np.count_nonzero(diff)),
+        }
+        if len(rising) >= 2:
+            periods = np.diff(rising)
+            period = float(np.mean(periods))
+            stats["freq_hz"] = sample_rate / period
+            stats["jitter_pct"] = float(np.std(periods) / period * 100)
+        return stats
+
     def measure_frequency(self, samples, channel=0, sample_rate=20_000_000):
-        ch = self.channel_bits(samples, channel)
-        rising = np.where(np.diff(ch.astype(np.int8)) == 1)[0]
-        if len(rising) < 2:
+        """Print a one-line report and return the frequency in Hz (0.0 if none)."""
+        m = self.measure(samples, channel, sample_rate)
+        if m["freq_hz"] == 0.0:
             print(f"[LA] CH{channel}: no periodic signal detected")
             return 0.0
-        period = np.mean(np.diff(rising))
-        freq = sample_rate / period
-        duty = np.mean(ch) * 100
-        jitter_pct = np.std(np.diff(rising)) / period * 100
-        print(f"[LA] CH{channel}: {freq:,.1f} Hz, {duty:.1f}% duty, jitter {jitter_pct:.2f}%")
-        return freq
+        print(f"[LA] CH{channel}: {m['freq_hz']:,.1f} Hz, {m['duty_pct']:.1f}% duty, "
+              f"jitter {m['jitter_pct']:.2f}%")
+        return m["freq_hz"]
 
     def summary(self, samples, sample_rate=20_000_000):
-        """Print summary of all active channels."""
+        """Print and return measure() of every channel with more than 2 edges."""
+        active = []
         for ch in range(self.channels):
-            sig = self.channel_bits(samples, ch)
-            edges = int(np.sum(np.abs(np.diff(sig.astype(np.int8)))))
-            if edges > 2:
-                rising = np.where(np.diff(sig.astype(np.int8)) == 1)[0]
-                freq = sample_rate / np.mean(np.diff(rising)) if len(rising) >= 2 else 0
-                print(f"  CH{ch:02d}: {freq:>10,.0f} Hz  {np.mean(sig)*100:5.1f}% duty  {edges:>8,} edges")
+            m = self.measure(samples, ch, sample_rate)
+            if m["edges"] > 2:
+                print(f"  CH{ch:02d}: {m['freq_hz']:>10,.0f} Hz  {m['duty_pct']:5.1f}% duty  "
+                      f"{m['edges']:>8,} edges")
+                active.append(m)
+        return active
 
 
 # ═══════════════════════════════════
@@ -228,21 +283,73 @@ def decode_i2c(samples, sda_ch, scl_ch):
     return txns
 
 
-if __name__ == "__main__":
-    la = LogicAnalyzer()
-    if "--scan" in sys.argv:
-        la.scan()
-    elif "--prime" in sys.argv:
-        la.prime()
+# ═══════════════════════════════════
+# Command line
+# ═══════════════════════════════════
+
+def _cli(args):
+    la = LogicAnalyzer(channels=args.channels)
+    if args.scan:
+        la.scan()  # prints pxlobster's device list
+        devices = _parse_devices(la.last_output)
+        result = {"ok": bool(devices), "devices": devices}
+        fallback = "no supported devices found"
+    elif args.prime:
+        ok = la.prime()
+        if la.last_output.strip():
+            print(la.last_output.strip())
+        result = {"ok": ok, "devices": _parse_devices(la.last_output)}
+        fallback = "no device reported the bitstream as loaded"
     else:
-        rate = 20_000_000
-        dur = 200
-        for i, a in enumerate(sys.argv[1:], 1):
-            if a == "--rate" and i < len(sys.argv) - 1:
-                rate = int(float(sys.argv[i + 1]))
-            elif a == "--time" and i < len(sys.argv) - 1:
-                dur = int(sys.argv[i + 1])
         la.prime()
-        data = la.capture(rate=rate, duration_ms=dur)
-        if len(data) > 0:
-            la.summary(data, sample_rate=la.nearest_rate(rate))
+        rate = la.nearest_rate(args.rate)
+        data = la.capture(rate=rate, duration_ms=args.time)
+        if len(data):
+            result = {"ok": True, "sample_rate": rate, "duration_ms": args.time,
+                      "samples": int(len(data)),
+                      "active_channels": la.summary(data, sample_rate=rate)}
+        else:
+            result = {"ok": False}
+        fallback = "capture returned no data"
+    if not result["ok"]:
+        result["error"] = la.last_error or fallback
+        if not la.last_error and not la.last_output.strip():  # nothing was shown yet
+            print(f"[LA] {fallback}", file=sys.stderr)
+    return result
+
+
+def main(argv=None):
+    """Entry point of `pxlogic-agent` and `python px_logic.py`; returns the exit code."""
+    import argparse
+    import contextlib
+    import json
+
+    p = argparse.ArgumentParser(
+        description="Capture with a PX Logic analyzer through pxlobster and "
+                    "summarise every active channel.")
+    action = p.add_mutually_exclusive_group()
+    action.add_argument("--scan", action="store_true", help="list supported devices and exit")
+    action.add_argument("--prime", action="store_true", help="load the FPGA bitstream and exit")
+    p.add_argument("--rate", type=float, default=20e6,
+                   help="sample rate in Hz, snapped to the nearest supported rate (default: 20e6)")
+    p.add_argument("--time", type=int, default=200, help="capture length in ms (default: 200)")
+    p.add_argument("--channels", type=int, choices=(16, 32), default=32,
+                   help="channel count of the device (default: 32)")
+    p.add_argument("--json", action="store_true",
+                   help="print exactly one JSON object on stdout; logs go to stderr")
+    args = p.parse_args(argv)
+
+    try:
+        with contextlib.redirect_stdout(sys.stderr if args.json else sys.stdout):
+            result = _cli(args)
+    except Exception as e:  # agents get failures as JSON, humans get the traceback
+        if not args.json:
+            raise
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -198,6 +198,26 @@ class AnalysisTest(unittest.TestCase):
             freq = self.la.measure_frequency(np.zeros(1000, dtype=np.uint32), channel=0)
         self.assertEqual(freq, 0.0)
 
+    def test_measure_returns_stats(self):
+        rate, period = 1_000_000, 2_500  # 400 Hz
+        t = np.arange(rate // 20)  # 50 ms = 20 periods
+        pwm = (t % period) < period // 4  # 25 % duty
+        m = self.la.measure(pack({0: pwm}), channel=0, sample_rate=rate)
+        self.assertEqual(m["channel"], 0)
+        self.assertAlmostEqual(m["freq_hz"], 400.0, places=6)
+        self.assertAlmostEqual(m["duty_pct"], 25.0, places=6)
+        self.assertAlmostEqual(m["jitter_pct"], 0.0, places=6)
+        self.assertEqual(m["edges"], 39)  # 20 falling + 19 rising
+
+    def test_summary_returns_only_active_channels(self):
+        rate = 1_000_000
+        t = np.arange(rate // 20)
+        samples = pack({0: (t % 2_500) < 625, 3: np.zeros_like(t), 7: (t % 1_000) < 500})
+        with contextlib.redirect_stdout(io.StringIO()):
+            active = self.la.summary(samples, sample_rate=rate)
+        self.assertEqual([m["channel"] for m in active], [0, 7])
+        self.assertAlmostEqual(active[1]["freq_hz"], 1000.0, places=6)
+
     def test_nearest_rate(self):
         self.assertEqual(self.la.nearest_rate(19_000_000), 20_000_000)
         self.assertEqual(self.la.nearest_rate(1.2e9), 1_000_000_000)

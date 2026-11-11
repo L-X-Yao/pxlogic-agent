@@ -13,3 +13,8 @@ pxlobster-*
 __pycache__/
 *.pyc
 .venv/
+
+# packaging
+build/
+dist/
+*.egg-info/
