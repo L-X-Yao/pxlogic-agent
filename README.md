@@ -11,12 +11,12 @@ A PX Logic logic-analyzer toolkit for AI agents: capture, frequency measurement 
 ## 代理怎么用
 
 1. 按下文“安装”一节装好 pxlobster 和本工具。
-2. 在本仓库目录启动 Claude Code，它会自动读取 [CLAUDE.md](CLAUDE.md) 里的操作约定。
+2. 在本仓库目录启动 Claude Code，它会自动读取 [CLAUDE.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/CLAUDE.md) 里的操作约定。
 3. 直接描述需求，例如“CH0 接了 PWM，测一下频率和占空比”，或“CH5 是 115200 的串口，抓 200 ms 解出内容”。代理会调用 `pxlogic-agent --json` 或 Python API 完成采集和解码。
 
 在其他项目里用：pip 安装后，把仓库里的 `skills/pxlogic` 目录复制到 `~/.claude/skills/`，Claude Code 在任何项目里遇到相关需求都会加载它。
 
-Codex、Cursor 等代理读取 [AGENTS.md](AGENTS.md)。人也可以直接使用下文的命令行和 Python API。
+Codex、Cursor 等代理读取 [AGENTS.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/AGENTS.md)。人也可以直接使用下文的命令行和 Python API。
 
 ## 已验证环境
 
@@ -215,4 +215,4 @@ python3 -m unittest discover -s tests -v
 
 ## 许可证
 
-本仓库代码采用 MIT 许可证，见 [LICENSE](LICENSE)。pxlobster 及其内置位流按各自的许可证分发，不包含在本仓库中。
+本仓库代码采用 MIT 许可证，见 [LICENSE](https://github.com/L-X-Yao/pxlogic-agent/blob/main/LICENSE)。pxlobster 及其内置位流按各自的许可证分发，不包含在本仓库中。
