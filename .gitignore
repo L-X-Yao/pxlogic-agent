@@ -1,0 +1,15 @@
+# pxlobster binaries and archives: download from upstream, never commit
+pxlobster
+pxlobster.exe
+pxlobster-*
+*.tar.gz
+*.zip
+
+# captures
+*.bin
+*.sr
+
+# Python
+__pycache__/
+*.pyc
+.venv/
