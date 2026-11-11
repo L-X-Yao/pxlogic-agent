@@ -12,8 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.9", "3.14"]
+        include:
+          - { os: ubuntu-latest, python: "3.14" }
+          - { os: ubuntu-24.04, python: "3.9" }  # setup-python has no 3.9 build for Ubuntu 26.04
+          - { os: windows-latest, python: "3.9" }
+          - { os: windows-latest, python: "3.14" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
