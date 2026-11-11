@@ -17,7 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from px_logic import main  # noqa: E402
+from px_logic import LogicAnalyzer, main  # noqa: E402
 
 # Mimics the stdout format of pxlobster v0.2.4 (src/main.zig).
 FAKE_PXLOBSTER = """#!{python}
@@ -64,6 +64,15 @@ class MissingBinaryTest(unittest.TestCase):
         result = json.loads(out)
         self.assertFalse(result["ok"])
         self.assertIn("PXLOBSTER", result["error"])
+
+
+class CaptureModeTest(unittest.TestCase):
+    def test_loop_and_unknown_modes_are_rejected(self):
+        la = LogicAnalyzer(exe_path="pxlobster")  # never started: the check comes first
+        with self.assertRaisesRegex(ValueError, "pxlobster --stop"):
+            la.capture(mode="loop")
+        with self.assertRaises(ValueError):
+            la.capture(mode="bogus")
 
 
 @unittest.skipIf(os.name == "nt", "the fake pxlobster is a POSIX script")

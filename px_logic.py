@@ -112,7 +112,8 @@ class LogicAnalyzer:
         Args:
             rate: sample rate in Hz (auto-snapped to nearest supported value)
             duration_ms: capture duration
-            mode: "buffer", "stream", or "loop"
+            mode: "buffer" or "stream". "loop" runs until stopped, so it is
+                rejected; run `pxlobster --mode loop` directly instead
             triggers: trigger spec string, e.g. "0=r" (CH0 rising edge)
             decode_cross: decode DMA cross-lane format to standard packed samples
             timeout_s: give up after this many seconds, e.g. when a trigger
@@ -122,6 +123,12 @@ class LogicAnalyzer:
             numpy array shape (n_samples,) dtype uint32 — bit N = channel N value.
             Empty on failure or timeout; the reason is in self.last_error.
         """
+        if mode == "loop":
+            raise ValueError("loop mode runs until stopped, so capture() could only time out "
+                             "and return nothing; run `pxlobster --mode loop` directly and "
+                             "end it with `pxlobster --stop`")
+        if mode not in ("buffer", "stream"):
+            raise ValueError(f'mode must be "buffer" or "stream", not {mode!r}')
         rate = self.nearest_rate(rate)
         fd, path = tempfile.mkstemp(suffix=".bin")
         os.close(fd)

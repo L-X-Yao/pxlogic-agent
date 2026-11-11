@@ -155,7 +155,7 @@ for t in decode_i2c(data, sda_ch=0, scl_ch=1):
 pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=0)  # [(mosi, miso), ...]
 ```
 
-`capture()` 还接受 `mode`（`"buffer"` / `"stream"` / `"loop"`）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）和 `timeout_s`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
+`capture()` 还接受 `mode`（`"buffer"` 或 `"stream"`；loop 模式会一直运行到被停止，`capture()` 直接报错，需要时请直接运行 pxlobster，再用 `--stop` 结束）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）和 `timeout_s`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
 
 三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI 还有 `bits`，小于 8 表示片选释放时不满一个字。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
 
