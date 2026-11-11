@@ -1,0 +1,35 @@
+---
+name: pxlogic
+description: 用 PX Logic 逻辑分析仪采集和分析数字信号：测 PWM 频率、占空比和抖动，抓 UART / SPI / I2C 波形并解码。用户提到逻辑分析仪、PX Logic、pxlobster、抓波形、测频率、看串口或 I2C / SPI 总线时使用。Capture and decode digital signals (PWM frequency and duty, UART, SPI, I2C) with a PX Logic logic analyzer.
+---
+
+# PX Logic 逻辑分析仪
+
+通过 `pxlogic-agent` 命令和 `px_logic` Python 模块操作设备，安装方式：`pip install git+https://github.com/L-X-Yao/pxlogic-agent`。底层采集由 pxlobster 完成，它要在 PATH 里，或由环境变量 `PXLOBSTER` 指定。
+
+## 步骤
+
+1. 确认设备在线：`pxlogic-agent --json --scan`，`ok` 为 true 才继续。
+2. 测频率、占空比：`pxlogic-agent --json --rate <Hz> --time <ms>`，读 stdout 的 JSON 里的 `active_channels`，不要解析日志。
+3. 等触发：加 `--trigger "0=r"`（CH0 上升沿）和 `--timeout <秒>`；超时后会自动发送 `--stop`。
+4. 解码用 Python API：
+
+```python
+from px_logic import LogicAnalyzer, decode_uart, decode_i2c, decode_spi
+
+la = LogicAnalyzer()                     # 16 通道设备写 LogicAnalyzer(channels=16)
+rate = la.nearest_rate(20e6)
+data = la.capture(rate=rate, duration_ms=200)   # 空数组表示失败，原因在 la.last_error
+print(bytes(decode_uart(data, channel=5, baudrate=115200, sample_rate=rate)))
+txns = decode_i2c(data, sda_ch=0, scl_ch=1)     # [{"addr", "rw", "data", "acks"}, ...]
+pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=0)
+```
+
+## 规则
+
+- 测频和解码用的 `sample_rate` 必须等于 `nearest_rate()` 取整后的值。
+- 采样率至少取被测信号最高频率的 10 倍；解 UART 时至少取波特率的 10 倍。
+- 采样点数等于采样率乘时长，32 通道每点 4 字节；单次尽量不超过 5000 万点（约 200 MB）。
+- 解码器只支持 UART 8N1、SPI 8 位帧、I2C 7 位地址。
+- 找不到设备时：WSL 里先确认 Windows 侧执行过 `usbipd attach --wsl --busid <BUSID>`，再用 `lsusb` 查找 `16c0:05dc` 或 `1a86:5237`。
+- 需要中止正在进行的采集时，执行 `pxlobster --stop`。

@@ -14,7 +14,9 @@ A PX Logic logic-analyzer toolkit for AI agents: capture, frequency measurement 
 2. 在本仓库目录启动 Claude Code，它会自动读取 [CLAUDE.md](CLAUDE.md) 里的操作约定。
 3. 直接描述需求，例如“CH0 接了 PWM，测一下频率和占空比”，或“CH5 是 115200 的串口，抓 200 ms 解出内容”。代理会调用 `pxlogic-agent --json` 或 Python API 完成采集和解码。
 
-用其他代理时，把 CLAUDE.md 和本 README 一起交给它。人也可以直接使用下文的 Python API 和 CLI。
+在其他项目里用：pip 安装后，把仓库里的 `skills/pxlogic` 目录复制到 `~/.claude/skills/`，Claude Code 在任何项目里遇到相关需求都会加载它。
+
+Codex、Cursor 等代理读取 [AGENTS.md](AGENTS.md)。人也可以直接使用下文的命令行和 Python API。
 
 ## 已验证环境
 
@@ -120,6 +122,8 @@ pxlogic-agent --json --rate 20e6 --time 200
 | `--rate` | 采样率（Hz），取最近的支持值，默认 20e6 |
 | `--time` | 采集时长（ms），默认 200 |
 | `--channels` | 设备通道数，16 或 32，默认 32 |
+| `--trigger` | 触发条件，如 `0=r`（CH0 上升沿），语法同 pxlobster 的 `-t` |
+| `--timeout` | 最长等待秒数，超时后自动发送 `--stop`，默认 max(30, 5 × 时长 + 10) |
 | `--json` | stdout 只输出 JSON |
 
 ### Python API
@@ -143,7 +147,7 @@ for t in decode_i2c(data, sda_ch=0, scl_ch=1):
 pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=0)  # [(mosi, miso), ...]
 ```
 
-`capture()` 还接受 `mode`（`"buffer"` / `"stream"` / `"loop"`）和 `triggers`（如 `"0=r"`，表示 CH0 上升沿）。采集失败时返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
+`capture()` 还接受 `mode`（`"buffer"` / `"stream"` / `"loop"`）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）和 `timeout_s`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
 
 ### 直接调用 pxlobster
 

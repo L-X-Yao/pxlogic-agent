@@ -21,14 +21,21 @@ from px_logic import main  # noqa: E402
 
 # Mimics the stdout format of pxlobster v0.2.4 (src/main.zig).
 FAKE_PXLOBSTER = """#!{python}
+import os
 import sys
+import time
 import numpy as np
 
 args = sys.argv[1:]
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
 if "--scan" in args:
     print("16C0:05DC  PX-Logic U2 channel 32")
 elif "--prime-fw" in args:
     print("16C0:05DC  PX-Logic U2 channel 32  [fw loaded]")
+elif "--stop" in args:
+    open(os.path.join(here, "stopped"), "w").close()
+elif "-t" in args:
+    time.sleep(30)  # the trigger never fires
 elif "-o" in args:
     rate = int(args[args.index("--samplerate") + 1])
     ms = int(args[args.index("--time") + 1])
@@ -96,6 +103,14 @@ class FakeDeviceTest(unittest.TestCase):
         self.assertAlmostEqual(ch0["freq_hz"], 400.0)
         self.assertAlmostEqual(ch0["duty_pct"], 25.0)
         self.assertIn("samples @", err)  # progress logs went to stderr
+
+    def test_trigger_timeout_sends_stop(self):
+        code, out, _ = run_main(["--json", "--trigger", "0=r", "--timeout", "1"], self.env)
+        self.assertEqual(code, 1)
+        result = json.loads(out)
+        self.assertFalse(result["ok"])
+        self.assertIn("timed out", result["error"])
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "stopped")))
 
     def test_human_output_without_json(self):
         code, out, _ = run_main(["--rate", "1e6", "--time", "50"], self.env)

@@ -106,7 +106,7 @@ class LogicAnalyzer:
         return min(self.SUPPORTED_RATES, key=lambda r: abs(r - target_hz))
 
     def capture(self, rate=20_000_000, duration_ms=100, mode="buffer",
-                triggers=None, decode_cross=True):
+                triggers=None, decode_cross=True, timeout_s=None):
         """Capture logic data.
 
         Args:
@@ -115,9 +115,12 @@ class LogicAnalyzer:
             mode: "buffer", "stream", or "loop"
             triggers: trigger spec string, e.g. "0=r" (CH0 rising edge)
             decode_cross: decode DMA cross-lane format to standard packed samples
+            timeout_s: give up after this many seconds, e.g. when a trigger
+                never fires (default: max(30, 5 x duration + 10 s))
 
         Returns:
-            numpy array shape (n_samples,) dtype uint32 — bit N = channel N value
+            numpy array shape (n_samples,) dtype uint32 — bit N = channel N value.
+            Empty on failure or timeout; the reason is in self.last_error.
         """
         rate = self.nearest_rate(rate)
         fd, path = tempfile.mkstemp(suffix=".bin")
@@ -132,9 +135,21 @@ class LogicAnalyzer:
         if triggers:
             cmd.extend(["-t", triggers])
 
-        timeout_sec = max(30, duration_ms / 1000 * 5 + 10)
+        if timeout_s is None:
+            timeout_s = max(30, duration_ms / 1000 * 5 + 10)
         try:
-            r = self._run(cmd, timeout=timeout_sec)
+            try:
+                r = self._run(cmd, timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                # the killed pxlobster can leave the device armed; disarm it
+                try:
+                    self.stop()
+                    note = "sent --stop"
+                except (OSError, subprocess.SubprocessError):
+                    note = "--stop failed as well"
+                self.last_error = f"capture timed out after {timeout_s:g} s (trigger never fired?); {note}"
+                print(f"[LA] {self.last_error}", file=sys.stderr)
+                return np.array([], dtype=np.uint32)
             if r.returncode != 0:
                 return np.array([], dtype=np.uint32)
             raw = np.fromfile(path, dtype=np.uint8)
@@ -303,7 +318,8 @@ def _cli(args):
     else:
         la.prime()
         rate = la.nearest_rate(args.rate)
-        data = la.capture(rate=rate, duration_ms=args.time)
+        data = la.capture(rate=rate, duration_ms=args.time,
+                          triggers=args.trigger, timeout_s=args.timeout)
         if len(data):
             result = {"ok": True, "sample_rate": rate, "duration_ms": args.time,
                       "samples": int(len(data)),
@@ -335,6 +351,11 @@ def main(argv=None):
     p.add_argument("--time", type=int, default=200, help="capture length in ms (default: 200)")
     p.add_argument("--channels", type=int, choices=(16, 32), default=32,
                    help="channel count of the device (default: 32)")
+    p.add_argument("--trigger", metavar="SPEC",
+                   help='pxlobster trigger spec, e.g. "0=r" for a CH0 rising edge')
+    p.add_argument("--timeout", type=float, metavar="S",
+                   help="give up after S seconds and send --stop "
+                        "(default: max(30, 5 x time + 10))")
     p.add_argument("--json", action="store_true",
                    help="print exactly one JSON object on stdout; logs go to stderr")
     args = p.parse_args(argv)
