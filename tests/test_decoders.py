@@ -9,14 +9,18 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from px_logic import LogicAnalyzer, decode_i2c, decode_spi, decode_uart  # noqa: E402
+from px_logic import (LogicAnalyzer, decode_i2c, decode_spi, decode_uart,  # noqa: E402
+                      load_capture, main)
 
 
 def pack(channels):
@@ -252,6 +256,27 @@ class SpiTest(unittest.TestCase):
         self.assertEqual([(w["mosi"], w["miso"], w["bits"]) for w in words],
                          [(0x28, 0xE7, 8), (0x00, 0x1F, 5), (0x81, 0x7E, 8), (0x12, 0x34, 8)])
 
+    def test_16_bit_words(self):
+        sclk, mosi, miso, cs = spi_wave([[(0xA5, 0x3C), (0x00, 0xFF)]], 0)
+        samples = pack({2: sclk, 3: mosi, 4: miso, 5: cs})
+        words = decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5,
+                           word_bits=16, detail=True)
+        self.assertEqual([(w["mosi"], w["miso"], w["bits"]) for w in words],
+                         [(0xA500, 0x3CFF, 16)])
+
+    def test_lsb_first(self):
+        sclk, mosi, miso, _ = spi_wave([[(0x01, 0x80)]], 0)
+        samples = pack({2: sclk, 3: mosi, 4: miso})
+        self.assertEqual(decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4,
+                                    lsb_first=True), [(0x80, 0x01)])
+
+    def test_invalid_word_bits(self):
+        sclk, mosi, miso, _ = spi_wave([[(0x00, 0x00)]], 0)
+        samples = pack({2: sclk, 3: mosi, 4: miso})
+        for bits in (0, 33):
+            with self.subTest(word_bits=bits), self.assertRaises(ValueError):
+                decode_spi(samples, sclk_ch=2, mosi_ch=3, miso_ch=4, word_bits=bits)
+
 
 class I2cTest(unittest.TestCase):
     def decode(self, messages):
@@ -373,6 +398,103 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(self.la.nearest_rate(19_000_000), 20_000_000)
         self.assertEqual(self.la.nearest_rate(1.2e9), 1_000_000_000)
         self.assertEqual(self.la.nearest_rate(2_100), 2_000)
+
+    def test_analysis_needs_no_pxlobster(self):
+        la = LogicAnalyzer()  # the binary is resolved only when a device is used
+        t = np.arange(2_000)
+        m = la.measure(pack({0: (t % 1_000) >= 500}), channel=0, sample_rate=1_000_000)
+        self.assertAlmostEqual(m["freq_hz"], 1_000.0)
+
+
+class CliDecodeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        # Point PXLOBSTER at a missing file: --input must never need the binary.
+        self.env = {"PXLOBSTER": os.path.join(self.tmp, "missing-pxlobster")}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def write(self, samples, name="cap.bin"):
+        path = os.path.join(self.tmp, name)
+        samples.tofile(path)
+        return path
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.env), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_uart_input_json(self):
+        path = self.write(pack({5: uart_wave(b"Hi", 115_200, 20_000_000)}))
+        code, out, err = self.run_main([
+            "--json", "--input", path, "--rate", "20e6",
+            "--decode", "uart", "--channel", "5", "--baud", "115200"])
+        self.assertEqual(code, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["protocol"], "uart")
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["frames"], [ord("H"), ord("i")])
+        self.assertFalse(result["truncated"])
+
+    def test_uart_detail_and_limit(self):
+        path = self.write(pack({5: uart_wave(b"abcd", 115_200, 20_000_000)}))
+        code, out, err = self.run_main([
+            "--json", "--input", path, "--rate", "20e6", "--decode", "uart",
+            "--channel", "5", "--baud", "115200", "--detail", "--limit", "2"])
+        self.assertEqual(code, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["count"], 4)
+        self.assertTrue(result["truncated"])
+        self.assertEqual([f["value"] for f in result["frames"]], [ord("a"), ord("b")])
+        self.assertIn("framing_error", result["frames"][0])
+        self.assertIsInstance(result["frames"][0]["time_s"], float)
+
+    def test_missing_uart_args_is_json_error(self):
+        path = self.write(pack({5: uart_wave(b"x", 115_200, 20_000_000)}))
+        code, out, _ = self.run_main([
+            "--json", "--input", path, "--decode", "uart", "--channel", "5"])
+        self.assertEqual(code, 1)
+        self.assertIn("--baud", json.loads(out)["error"])
+
+    def test_spi_16_bit_input_json(self):
+        sclk, mosi, miso, cs = spi_wave([[(0xA5, 0x3C), (0x00, 0xFF)]], 0)
+        path = self.write(pack({2: sclk, 3: mosi, 4: miso, 5: cs}))
+        code, out, err = self.run_main([
+            "--json", "--input", path, "--rate", "1e6", "--decode", "spi",
+            "--sclk", "2", "--mosi", "3", "--miso", "4", "--cs", "5",
+            "--word-bits", "16"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["frames"], [[0xA500, 0x3CFF]])
+
+    def test_i2c_input_json(self):
+        scl, sda = i2c_wave([[(0x3C, "W", [0x00, 0xAF])]])
+        path = self.write(pack({0: sda, 1: scl}))
+        code, out, err = self.run_main([
+            "--json", "--input", path, "--rate", "1e6", "--decode", "i2c",
+            "--sda", "0", "--scl", "1"])
+        self.assertEqual(code, 0, err)
+        [frame] = json.loads(out)["frames"]
+        self.assertEqual((frame["addr"], frame["rw"], frame["data"]),
+                         (0x3C, "W", [0x00, 0xAF]))
+
+    def test_input_rejects_save_and_decode_rejects_scan(self):
+        path = self.write(pack({5: uart_wave(b"x", 115_200, 20_000_000)}))
+        code, out, _ = self.run_main(["--json", "--input", path, "--save", "x.bin"])
+        self.assertEqual(code, 1)
+        self.assertIn("--save", json.loads(out)["error"])
+        code, out, _ = self.run_main(["--json", "--scan", "--decode", "uart"])
+        self.assertEqual(code, 1)
+        self.assertIn("--scan", json.loads(out)["error"])
+
+    def test_load_capture_reads_16_channel_words(self):
+        path = os.path.join(self.tmp, "cap16.bin")
+        np.array([1, 0x8000], dtype=np.uint16).tofile(path)
+        data = load_capture(path, channels=16)
+        self.assertEqual(data.dtype, np.uint32)
+        self.assertEqual(data.tolist(), [1, 0x8000])
 
 
 if __name__ == "__main__":

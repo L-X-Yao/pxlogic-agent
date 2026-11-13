@@ -56,6 +56,16 @@ def _parse_devices(text):
     return devices
 
 
+def load_capture(path, channels=32):
+    """Read a packed capture written by capture() or pxlobster --decode-cross.
+
+    32-channel captures are uint32, 16-channel captures are uint16; both are
+    returned as uint32 with bit N holding channel N.
+    """
+    dtype = np.uint32 if channels > 16 else np.uint16
+    return np.fromfile(path, dtype=dtype).astype(np.uint32, copy=False)
+
+
 class LogicAnalyzer:
     SUPPORTED_RATES = [
         1_000_000_000, 500_000_000, 250_000_000, 125_000_000,
@@ -67,14 +77,20 @@ class LogicAnalyzer:
     ]
 
     def __init__(self, exe_path=None, channels=32):
-        self.exe = exe_path or _find_pxlobster()
+        # Resolved lazily so offline analysis needs no pxlobster binary.
+        self.exe = exe_path
         self.channels = channels
         self.bytes_per_sample = 4 if channels > 16 else 2
         self.last_output = ""  # stdout of the last pxlobster call
         self.last_error = ""   # why the last pxlobster call failed, "" on success
 
+    def _exe_path(self):
+        if not self.exe:
+            self.exe = _find_pxlobster()
+        return self.exe
+
     def _run(self, args, timeout=60):
-        r = subprocess.run([self.exe] + args,
+        r = subprocess.run([self._exe_path()] + args,
                            capture_output=True, text=True, timeout=timeout)
         err = r.stderr.strip()
         self.last_output = r.stdout
@@ -106,7 +122,7 @@ class LogicAnalyzer:
         return min(self.SUPPORTED_RATES, key=lambda r: abs(r - target_hz))
 
     def capture(self, rate=20_000_000, duration_ms=100, mode="buffer",
-                triggers=None, decode_cross=True, timeout_s=None):
+                triggers=None, decode_cross=True, timeout_s=None, save_path=None):
         """Capture logic data.
 
         Args:
@@ -118,6 +134,7 @@ class LogicAnalyzer:
             decode_cross: decode DMA cross-lane format to standard packed samples
             timeout_s: give up after this many seconds, e.g. when a trigger
                 never fires (default: max(30, 5 x duration + 10 s))
+            save_path: keep a copy of the raw .bin capture at this path
 
         Returns:
             numpy array shape (n_samples,) dtype uint32 — bit N = channel N value.
@@ -159,6 +176,8 @@ class LogicAnalyzer:
                 return np.array([], dtype=np.uint32)
             if r.returncode != 0:
                 return np.array([], dtype=np.uint32)
+            if save_path:
+                shutil.copyfile(path, save_path)
             raw = np.fromfile(path, dtype=np.uint8)
         finally:
             try:
@@ -309,19 +328,25 @@ def decode_uart(samples, channel, baudrate, sample_rate, *, data_bits=8,
 
 
 def decode_spi(samples, sclk_ch, mosi_ch, miso_ch=None, cs_ch=None, cpol=0, cpha=0,
-               *, sample_rate=None, detail=False):
-    """Decode SPI, MSB first, 8-bit words, CS active low.
+               *, word_bits=8, lsb_first=False, sample_rate=None, detail=False):
+    """Decode SPI, CS active low.
 
     Releasing CS ends the current word, so every frame starts aligned even
     when the capture began in the middle of a word. A word cut short this
-    way is still returned, with fewer than 8 bits.
+    way is still returned, with fewer than word_bits bits.
+
+    Args:
+        word_bits: bits per word, 1 to 32 (default 8)
+        lsb_first: shift in LSB first instead of MSB first
 
     Returns:
-        List of (mosi_byte, miso_byte) tuples. With detail=True, dicts with
-        keys mosi, miso, bits (8 unless cut short), start and end (sample
-        indices of the word's first and last sampling edge) and time_s
-        (None without sample_rate).
+        List of (mosi_word, miso_word) tuples. With detail=True, dicts with
+        keys mosi, miso, bits (word_bits unless cut short), start and end
+        (sample indices of the word's first and last sampling edge) and
+        time_s (None without sample_rate).
     """
+    if not 1 <= word_bits <= 32:
+        raise ValueError(f"word_bits must be 1 to 32, not {word_bits!r}")
     sclk = (samples >> sclk_ch) & 1
     mosi = (samples >> mosi_ch) & 1
     miso = (samples >> miso_ch) & 1 if miso_ch is not None else np.zeros_like(mosi)
@@ -352,10 +377,14 @@ def decode_spi(samples, sclk_ch, mosi_ch, miso_ch=None, cs_ch=None, cpol=0, cpha
         if not bits:
             first = idx
         last = idx
-        mo = (mo << 1) | int(mosi[idx])
-        mi = (mi << 1) | int(miso[idx])
+        if lsb_first:
+            mo |= int(mosi[idx]) << bits
+            mi |= int(miso[idx]) << bits
+        else:
+            mo = (mo << 1) | int(mosi[idx])
+            mi = (mi << 1) | int(miso[idx])
         bits += 1
-        if bits == 8:
+        if bits == word_bits:
             flush()
             mo = mi = bits = 0
     if bits and r < len(releases):  # CS released after the last edge
@@ -418,7 +447,89 @@ def decode_i2c(samples, sda_ch, scl_ch, *, sample_rate=None, detail=False):
 # Command line
 # ═══════════════════════════════════
 
+def _check_channel(option, value, channels):
+    if value is not None and not 0 <= value < channels:
+        raise ValueError(f"{option} must be between 0 and {channels - 1}")
+
+
+def _validate_decode_args(args):
+    if not args.decode:
+        return
+    if args.limit < 0:
+        raise ValueError("--limit must be 0 or more")
+    if args.decode == "uart":
+        if args.channel is None:
+            raise ValueError("--decode uart requires --channel")
+        if args.baud is None:
+            raise ValueError("--decode uart requires --baud")
+        if args.baud <= 0:
+            raise ValueError("--baud must be positive")
+        if not 5 <= args.data_bits <= 9:
+            raise ValueError("--data-bits must be 5 to 9")
+        _check_channel("--channel", args.channel, args.channels)
+    elif args.decode == "spi":
+        if args.sclk is None or args.mosi is None:
+            raise ValueError("--decode spi requires --sclk and --mosi")
+        if not 1 <= args.word_bits <= 32:
+            raise ValueError("--word-bits must be 1 to 32")
+        for option, value in (("--sclk", args.sclk), ("--mosi", args.mosi),
+                              ("--miso", args.miso), ("--cs", args.cs)):
+            _check_channel(option, value, args.channels)
+    else:
+        if args.sda is None or args.scl is None:
+            raise ValueError("--decode i2c requires --sda and --scl")
+        _check_channel("--sda", args.sda, args.channels)
+        _check_channel("--scl", args.scl, args.channels)
+
+
+def _decode_cli(args, samples, sample_rate):
+    if args.decode == "uart":
+        frames = decode_uart(samples, args.channel, args.baud, sample_rate,
+                             data_bits=args.data_bits, parity=args.parity,
+                             stop_bits=args.stop_bits, invert=args.invert,
+                             detail=args.detail)
+    elif args.decode == "spi":
+        frames = decode_spi(samples, args.sclk, args.mosi, args.miso, args.cs,
+                            cpol=args.cpol, cpha=args.cpha, word_bits=args.word_bits,
+                            lsb_first=args.lsb_first, sample_rate=sample_rate,
+                            detail=args.detail)
+    else:
+        frames = decode_i2c(samples, args.sda, args.scl, sample_rate=sample_rate,
+                            detail=args.detail)
+    total = len(frames)
+    truncated = bool(args.limit and total > args.limit)
+    if truncated:
+        frames = frames[:args.limit]
+    return {"ok": True, "protocol": args.decode, "sample_rate": sample_rate,
+            "count": total, "truncated": truncated, "frames": frames}
+
+
+def _print_decoded(protocol, frames):
+    for f in frames:
+        if protocol == "uart":
+            if isinstance(f, dict):
+                print(f"{f['time_s']:9.6f}s  0x{f['value']:02X}"
+                      f"{' framing' if f['framing_error'] else ''}"
+                      f"{' parity' if f['parity_error'] else ''}")
+            else:
+                print(f"0x{f:02X}")
+        elif protocol == "spi":
+            if isinstance(f, dict):
+                ts = f"{f['time_s']:9.6f}s" if f["time_s"] is not None else " " * 10
+                print(f"{ts}  MOSI 0x{f['mosi']:X}  MISO 0x{f['miso']:X}  {f['bits']} bits")
+            else:
+                print(f"MOSI 0x{f[0]:02X}  MISO 0x{f[1]:02X}")
+        else:
+            ts = f"{f['time_s']:9.6f}s" if f.get("time_s") is not None else " " * 10
+            data = " ".join(f"{b:02X}" for b in f["data"])
+            acks = " ".join("A" if a else "N" for a in f["acks"])
+            print(f"{ts}  {f['rw']} 0x{f['addr']:02X}: {data}  [{acks}]")
+
+
 def _cli(args):
+    if (args.scan or args.prime) and (args.decode or args.save):
+        raise ValueError("--decode and --save cannot be used with --scan or --prime")
+    _validate_decode_args(args)
     la = LogicAnalyzer(channels=args.channels)
     if args.scan:
         la.scan()  # prints pxlobster's device list
@@ -432,17 +543,45 @@ def _cli(args):
         result = {"ok": ok, "devices": _parse_devices(la.last_output)}
         fallback = "no device reported the bitstream as loaded"
     else:
-        la.prime()
-        rate = la.nearest_rate(args.rate)
-        data = la.capture(rate=rate, duration_ms=args.time,
-                          triggers=args.trigger, timeout_s=args.timeout)
-        if len(data):
-            result = {"ok": True, "sample_rate": rate, "duration_ms": args.time,
+        if args.input:
+            if args.save:
+                raise ValueError("--input cannot be combined with --save")
+            if args.trigger or args.timeout is not None:
+                raise ValueError("--input cannot be combined with --trigger or --timeout")
+            rate = la.nearest_rate(args.rate)
+            data = load_capture(args.input, args.channels)
+            fallback = "no data in the input file"
+        else:
+            la.prime()
+            rate = la.nearest_rate(args.rate)
+            data = la.capture(rate=rate, duration_ms=args.time,
+                              triggers=args.trigger, timeout_s=args.timeout,
+                              save_path=args.save)
+            fallback = "capture returned no data"
+        if not len(data):
+            result = {"ok": False}
+        elif args.decode:
+            result = _decode_cli(args, data, rate)
+            result["samples"] = int(len(data))
+            result["duration_ms"] = round(len(data) * 1000 / rate, 3)
+            if args.input:
+                result["input"] = args.input
+            if args.save:
+                result["saved"] = args.save
+            if not args.json:
+                _print_decoded(args.decode, result["frames"])
+                if result["truncated"]:
+                    print(f"[LA] showing first {len(result['frames'])} of "
+                          f"{result['count']} frames", file=sys.stderr)
+        else:
+            duration_ms = args.time if not args.input else round(len(data) * 1000 / rate, 3)
+            result = {"ok": True, "sample_rate": rate, "duration_ms": duration_ms,
                       "samples": int(len(data)),
                       "active_channels": la.summary(data, sample_rate=rate)}
-        else:
-            result = {"ok": False}
-        fallback = "capture returned no data"
+            if args.input:
+                result["input"] = args.input
+            if args.save:
+                result["saved"] = args.save
     if not result["ok"]:
         result["error"] = la.last_error or fallback
         if not la.last_error and not la.last_output.strip():  # nothing was shown yet
@@ -457,14 +596,17 @@ def main(argv=None):
     import json
 
     p = argparse.ArgumentParser(
-        description="Capture with a PX Logic analyzer through pxlobster and "
-                    "summarise every active channel.")
+        description="Capture with a PX Logic analyzer through pxlobster, "
+                    "summarise channels or decode a protocol.")
     action = p.add_mutually_exclusive_group()
     action.add_argument("--scan", action="store_true", help="list supported devices and exit")
     action.add_argument("--prime", action="store_true", help="load the FPGA bitstream and exit")
+    action.add_argument("--input", metavar="FILE",
+                        help="analyze a saved .bin capture instead of capturing")
     p.add_argument("--rate", type=float, default=20e6,
                    help="sample rate in Hz, snapped to the nearest supported rate (default: 20e6)")
-    p.add_argument("--time", type=int, default=200, help="capture length in ms (default: 200)")
+    p.add_argument("--time", type=int, default=200,
+                   help="capture length in ms (default: 200; ignored with --input)")
     p.add_argument("--channels", type=int, choices=(16, 32), default=32,
                    help="channel count of the device (default: 32)")
     p.add_argument("--trigger", metavar="SPEC",
@@ -472,13 +614,57 @@ def main(argv=None):
     p.add_argument("--timeout", type=float, metavar="S",
                    help="give up after S seconds and send --stop "
                         "(default: max(30, 5 x time + 10))")
+    p.add_argument("--save", metavar="FILE",
+                   help="save the raw capture to FILE (packed .bin)")
+    p.add_argument("--decode", choices=("uart", "spi", "i2c"),
+                   help="decode a protocol instead of only summarising channels")
+    p.add_argument("--detail", action="store_true",
+                   help="include positions, times and error flags in decoded frames")
+    p.add_argument("--limit", type=int, default=10000, metavar="N",
+                   help="max decoded frames to return, 0 for all (default: 10000)")
     p.add_argument("--json", action="store_true",
                    help="print exactly one JSON object on stdout; logs go to stderr")
+
+    uart = p.add_argument_group("UART decode options")
+    uart.add_argument("--channel", type=int, metavar="CH", help="UART channel")
+    uart.add_argument("--baud", type=float, metavar="HZ", help="UART baud rate")
+    uart.add_argument("--data-bits", type=int, default=8,
+                      help="UART data bits, 5 to 9 (default: 8)")
+    uart.add_argument("--parity", choices=("none", "even", "odd"), default="none",
+                      help="UART parity (default: none)")
+    uart.add_argument("--stop-bits", type=int, choices=(1, 2), default=1,
+                      help="UART stop bits (default: 1)")
+    uart.add_argument("--invert", action="store_true",
+                      help="decode a line that idles low, e.g. SBUS")
+
+    spi = p.add_argument_group("SPI decode options")
+    spi.add_argument("--sclk", type=int, metavar="CH", help="SPI clock channel")
+    spi.add_argument("--mosi", type=int, metavar="CH", help="SPI MOSI channel")
+    spi.add_argument("--miso", type=int, metavar="CH", help="SPI MISO channel")
+    spi.add_argument("--cs", type=int, metavar="CH", help="SPI CS channel")
+    spi.add_argument("--cpol", type=int, choices=(0, 1), default=0,
+                     help="SPI clock polarity (default: 0)")
+    spi.add_argument("--cpha", type=int, choices=(0, 1), default=0,
+                     help="SPI clock phase (default: 0)")
+    spi.add_argument("--word-bits", type=int, default=8, metavar="N",
+                     help="SPI bits per word, 1 to 32 (default: 8)")
+    spi.add_argument("--lsb-first", action="store_true",
+                     help="SPI words are sent LSB first")
+
+    i2c = p.add_argument_group("I2C decode options")
+    i2c.add_argument("--sda", type=int, metavar="CH", help="I2C SDA channel")
+    i2c.add_argument("--scl", type=int, metavar="CH", help="I2C SCL channel")
+
     args = p.parse_args(argv)
 
     try:
         with contextlib.redirect_stdout(sys.stderr if args.json else sys.stdout):
             result = _cli(args)
+    except (ValueError, OSError) as e:
+        if not args.json:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     except Exception as e:  # agents get failures as JSON, humans get the traceback
         if not args.json:
             raise

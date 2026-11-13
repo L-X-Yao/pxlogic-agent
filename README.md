@@ -100,7 +100,7 @@ pxlogic-agent --rate 20e6 --time 200   # 采集 200 ms，打印各活动通道�
 
 ### 命令行（JSON 输出）
 
-`pxlogic-agent` 采集一段数据，汇总每个活动通道。加 `--json` 后，stdout 只输出一个 JSON 对象，日志全部转到 stderr。成功时退出码为 0，失败时为 1。
+`pxlogic-agent` 采集一段数据，汇总每个活动通道；加 `--decode` 时改为解码协议。加 `--json` 后，stdout 只输出一个 JSON 对象，日志全部转到 stderr。成功时退出码为 0，失败时为 1。
 
 ```bash
 pxlogic-agent --json --rate 20e6 --time 200
@@ -122,23 +122,61 @@ pxlogic-agent --json --rate 20e6 --time 200
 |---|---|
 | `--scan` | 只列出设备，JSON 里是 `devices` 列表 |
 | `--prime` | 只加载 FPGA 位流 |
+| `--input FILE` | 不采集，直接分析 `--save` 生成的 `.bin`；不需要设备 |
+| `--save FILE` | 采集成功后保存原始 `.bin` |
 | `--rate` | 采样率（Hz），取最近的支持值，默认 20e6 |
-| `--time` | 采集时长（ms），默认 200 |
+| `--time` | 采集时长（ms），默认 200；配 `--input` 时忽略 |
 | `--channels` | 设备通道数，16 或 32，默认 32 |
 | `--trigger` | 触发条件，如 `0=r`（CH0 上升沿），语法同 pxlobster 的 `-t` |
 | `--timeout` | 最长等待秒数，超时后自动发送 `--stop`，默认 max(30, 5 × 时长 + 10) |
+| `--decode` | 解码 `uart`、`spi` 或 `i2c`，结果在 JSON 的 `frames` 里 |
+| `--detail` | 解码结果带采样位置、`time_s` 和错误标志 |
+| `--limit` | 最多返回多少条解码结果，0 为不限，默认 10000 |
 | `--json` | stdout 只输出 JSON |
+
+解码参数：
+
+| 协议 | 参数 |
+|---|---|
+| UART | `--channel`、`--baud`、`--data-bits`、`--parity`、`--stop-bits`、`--invert` |
+| SPI | `--sclk`、`--mosi`、`--miso`、`--cs`、`--cpol`、`--cpha`、`--word-bits`、`--lsb-first` |
+| I2C | `--sda`、`--scl` |
+
+```bash
+# 采集 200 ms，解码 CH5 上的 115200 8N1 串口
+pxlogic-agent --json --rate 20e6 --time 200 --decode uart --channel 5 --baud 115200
+
+# 保存采集，之后离线解码，并保留每帧时间
+pxlogic-agent --json --rate 20e6 --time 200 --save cap.bin
+pxlogic-agent --json --input cap.bin --rate 20e6 --decode uart \
+  --channel 5 --baud 115200 --detail
+
+# 16 位 SPI，片选释放时重新对齐
+pxlogic-agent --json --input cap.bin --rate 20e6 --decode spi \
+  --sclk 2 --mosi 3 --miso 4 --cs 5 --word-bits 16
+```
+
+解码结果的 JSON 形如：
+
+```json
+{"ok": true, "protocol": "uart", "sample_rate": 20000000, "samples": 4000000,
+ "duration_ms": 200.0, "count": 2, "truncated": false, "frames": [72, 105]}
+```
+
+`--detail` 时 `frames` 里是对象：UART 有 `value`、`start`、`end`、`time_s`、`framing_error`、`parity_error`；SPI 有 `mosi`、`miso`、`bits`、`start`、`end`、`time_s`；I2C 有 `addr`、`rw`、`data`、`acks`、`start`、`end`、`time_s`。`count` 是截断前的总数，`truncated` 表示是否被 `--limit` 截断。
 
 ### Python API
 
 ```python
-from px_logic import LogicAnalyzer, decode_uart, decode_i2c, decode_spi
+from px_logic import LogicAnalyzer, decode_uart, decode_i2c, decode_spi, load_capture
 
 la = LogicAnalyzer()          # 16 通道设备写 LogicAnalyzer(channels=16)
 la.devices()                  # [{"usb_id": "16c0:05dc", "label": "PX-Logic U2 channel 32"}]
 
 rate = la.nearest_rate(20e6)  # capture() 会取最近的支持采样率，分析时要用同一个值
-data = la.capture(rate=rate, duration_ms=100)   # numpy uint32 数组，bit N = 通道 N
+data = la.capture(rate=rate, duration_ms=100, save_path="cap.bin")  # 可选：保存原始 .bin
+# 离线分析不需要设备：data = load_capture("cap.bin")
+# 16 通道文件写 load_capture("cap.bin", channels=16)
 m = la.measure(data, channel=0, sample_rate=rate)   # 键同上文 JSON 里 active_channels 的元素
 active = la.summary(data, sample_rate=rate)         # 打印并返回各活动通道的 measure() 结果
 
@@ -152,12 +190,14 @@ for f in decode_uart(data, channel=6, baudrate=100_000, sample_rate=rate,
 for t in decode_i2c(data, sda_ch=0, scl_ch=1):
     print(f"I2C {t['rw']} 0x{t['addr']:02X}: {[hex(b) for b in t['data']]}")
 
-pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=0)  # [(mosi, miso), ...]
+# 16 位 SPI 字；默认 8 位、MSB 先发
+pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=0,
+                   word_bits=16, lsb_first=False)  # [(mosi, miso), ...]
 ```
 
-`capture()` 还接受 `mode`（`"buffer"` 或 `"stream"`；loop 模式会一直运行到被停止，`capture()` 直接报错，需要时请直接运行 pxlobster，再用 `--stop` 结束）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）和 `timeout_s`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
+`capture()` 还接受 `mode`（`"buffer"` 或 `"stream"`；loop 模式会一直运行到被停止，`capture()` 直接报错，需要时请直接运行 pxlobster，再用 `--stop` 结束）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）、`timeout_s` 和 `save_path`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
 
-三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI 还有 `bits`，小于 8 表示片选释放时不满一个字。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
+三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI 还有 `bits`，小于 `word_bits` 表示片选释放时不满一个字。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
 
 ### 直接调用 pxlobster
 
@@ -187,6 +227,7 @@ print(f'{20e6 / np.mean(np.diff(r)):.1f} Hz' if len(r) > 1 else 'no signal')
 
 - 加 `--decode-cross`：每个采样点是一个小端字。32 通道设备为 uint32，16 通道为 uint16，bit N 对应通道 N。
 - 不加：原始 cross-lane DMA 格式。每个条带长度为通道数 × 8 字节，每个通道占一个 u64，u64 的 bit k 是第 k 个采样，一个条带含 64 个采样。
+- `--save` 和 `--input` 使用第一行的 packed `.bin`；`--input` 按 `--channels` 选择 uint32 或 uint16。
 
 ## 支持的采样率
 
@@ -199,7 +240,7 @@ USB 2.0 连接下，高采样率受带宽限制。
 | 函数 | 支持 | 限制 |
 |---|---|---|
 | `decode_uart` | 5–9 位数据，无 / 奇 / 偶校验，1 或 2 个停止位，LSB 先发；`invert=True` 用于空闲低电平的线路（如 SBUS）；起始位中点复核，滤掉毛刺 | 不支持 1.5 个停止位；错误标志只在 `detail=True` 时返回 |
-| `decode_spi` | 模式 0–3，MSB 先发，CS 低有效；每次片选释放都重新对齐，从字中间开始的采集只影响第一帧 | 按 8 位分帧；不满 8 位的残字照常返回；不给 `cs_ch` 时无法重新对齐 |
+| `decode_spi` | 模式 0–3，1–32 位字，MSB 或 LSB 先发，CS 低有效；每次片选释放都重新对齐，从字中间开始的采集只影响第一帧 | 不满 `word_bits` 的残字照常返回；不给 `cs_ch` 时无法重新对齐 |
 | `decode_i2c` | 7 位地址，重复起始，记录 ACK/NACK；收到地址字节的段都会列出，包括只发了地址的段 | 不支持 10 位地址 |
 
 单元测试用合成波形和一个模拟的 pxlobster，覆盖解码器和命令行，不需要硬件：

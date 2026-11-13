@@ -127,6 +127,19 @@ class FakeDeviceTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("CH00:", out)
 
+    def test_save_then_analyze_offline(self):
+        save = os.path.join(self.tmp, "cap.bin")
+        code, out, _ = run_main(["--json", "--rate", "1e6", "--time", "50",
+                                 "--save", save], self.env)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(save))
+        missing = {"PXLOBSTER": os.path.join(self.tmp, "no-such-pxlobster")}
+        code, out, err = run_main(["--json", "--input", save, "--rate", "1e6"], missing)
+        self.assertEqual(code, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["samples"], 50_000)
+        self.assertAlmostEqual(result["active_channels"][0]["freq_hz"], 400.0)
+
 
 if __name__ == "__main__":
     unittest.main()
