@@ -5,7 +5,7 @@
 ## 操作约定
 
 1. 先运行 `pxlogic-agent --json --scan`（未安装时用 `python3 px_logic.py --json --scan`），`ok` 为 true 才继续。
-2. 只需要频率、占空比时，运行 `pxlogic-agent --json --rate <Hz> --time <ms>`，读 stdout 的 JSON，不要解析日志。
+2. 只需要频率、占空比时，运行 `pxlogic-agent --json --rate <Hz> --time <ms>`，读 stdout 的 JSON，不要解析日志。复位、使能这类单次跳变加 `--min-edges 0`，否则默认只列边沿数大于 2 的通道。
 3. 需要等触发时，加 `--trigger "0=r"`（CH0 上升沿），并用 `--timeout <秒>` 限定等待时间；超时后工具会自动发送 `--stop`。
 4. 需要解码时优先用 `pxlogic-agent --json --decode uart|spi|i2c`，读 stdout JSON 的 `frames`；需要逐帧位置、时间和错误标志时加 `--detail`。采集时加 `--save <file>` 保存 `.bin`，之后用 `--input <file>` 离线分析，不需要设备。复杂场景用 Python API，读解码函数的返回值，不要解析打印输出。
 5. 测频和解码用的 `sample_rate` 必须等于 `nearest_rate()` 取整后的实际采样率。

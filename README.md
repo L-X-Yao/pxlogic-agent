@@ -127,6 +127,7 @@ pxlogic-agent --json --rate 20e6 --time 200
 | `--rate` | 采样率（Hz），取最近的支持值，默认 20e6 |
 | `--time` | 采集时长（ms），默认 200；配 `--input` 时忽略 |
 | `--channels` | 设备通道数，16 或 32，默认 32 |
+| `--min-edges` | 汇总边沿数大于 N 的通道，默认 2；0 可看到单边沿信号 |
 | `--trigger` | 触发条件，如 `0=r`（CH0 上升沿），语法同 pxlobster 的 `-t` |
 | `--timeout` | 最长等待秒数，超时后自动发送 `--stop`，默认 max(30, 5 × 时长 + 10) |
 | `--decode` | 解码 `uart`、`spi` 或 `i2c`，结果在 JSON 的 `frames` 里 |
@@ -178,7 +179,8 @@ data = la.capture(rate=rate, duration_ms=100, save_path="cap.bin")  # 可选：�
 # 离线分析不需要设备：data = load_capture("cap.bin")
 # 16 通道文件写 load_capture("cap.bin", channels=16)
 m = la.measure(data, channel=0, sample_rate=rate)   # 键同上文 JSON 里 active_channels 的元素
-active = la.summary(data, sample_rate=rate)         # 打印并返回各活动通道的 measure() 结果
+active = la.summary(data, sample_rate=rate)         # 默认只列边沿数大于 2 的通道
+active = la.summary(data, sample_rate=rate, min_edges=0)  # 也列出单边沿通道
 
 print(bytes(decode_uart(data, channel=5, baudrate=115200, sample_rate=rate)))
 
@@ -195,7 +197,7 @@ pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=
                    word_bits=16, lsb_first=False)  # [(mosi, miso), ...]
 ```
 
-`capture()` 还接受 `mode`（`"buffer"` 或 `"stream"`；loop 模式会一直运行到被停止，`capture()` 直接报错，需要时请直接运行 pxlobster，再用 `--stop` 结束）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）、`timeout_s` 和 `save_path`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。
+`capture()` 还接受 `mode`（`"buffer"` 或 `"stream"`；loop 模式会一直运行到被停止，`capture()` 直接报错，需要时请直接运行 pxlobster，再用 `--stop` 结束）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）、`timeout_s` 和 `save_path`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。`summary()` 默认只列边沿数大于 2 的通道；`min_edges=0` 可看到复位、使能这类单次跳变。
 
 三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI 还有 `bits`，小于 `word_bits` 表示片选释放时不满一个字。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
 

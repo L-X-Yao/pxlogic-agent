@@ -10,7 +10,7 @@ description: 用 PX Logic 逻辑分析仪采集和分析数字信号：测 PWM �
 ## 步骤
 
 1. 确认设备在线：`pxlogic-agent --json --scan`，`ok` 为 true 才继续。
-2. 测频率、占空比、脉宽：`pxlogic-agent --json --rate <Hz> --time <ms>`，读 stdout 的 JSON 里的 `active_channels`（`high_us` 是高电平脉宽，单位 µs），不要解析日志。
+2. 测频率、占空比、脉宽：`pxlogic-agent --json --rate <Hz> --time <ms>`，读 stdout 的 JSON 里的 `active_channels`（`high_us` 是高电平脉宽，单位 µs），不要解析日志。单次跳变加 `--min-edges 0`，否则默认只列边沿数大于 2 的通道。
 3. 等触发：加 `--trigger "0=r"`（CH0 上升沿）和 `--timeout <秒>`；超时后会自动发送 `--stop`。
 4. 解码优先用命令行，读 JSON 的 `frames`；采集时加 `--save`，之后可用 `--input` 离线分析：
 

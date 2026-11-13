@@ -246,12 +246,15 @@ class LogicAnalyzer:
               f"high {m['high_us']:,.2f} us, jitter {m['jitter_pct']:.2f}%")
         return m["freq_hz"]
 
-    def summary(self, samples, sample_rate=20_000_000):
-        """Print and return measure() of every channel with more than 2 edges."""
+    def summary(self, samples, sample_rate=20_000_000, min_edges=2):
+        """Print and return measure() of every channel with more than min_edges edges.
+
+        min_edges=0 includes one-shot signals that have a single edge.
+        """
         active = []
         for ch in range(self.channels):
             m = self.measure(samples, ch, sample_rate)
-            if m["edges"] > 2:
+            if m["edges"] > min_edges:
                 print(f"  CH{ch:02d}: {m['freq_hz']:>10,.0f} Hz  {m['duty_pct']:5.1f}% duty  "
                       f"{m['high_us']:>10,.2f} us high  {m['edges']:>8,} edges")
                 active.append(m)
@@ -299,31 +302,33 @@ def decode_uart(samples, channel, baudrate, sample_rate, *, data_bits=8,
     centre = [int(spb * (k + 0.5)) for k in range(n_bits)]  # bit centres from the start edge
     span = int(spb * n_bits)
     result = []
-    i = 0
-    while i < len(sig) - span - 1:
-        if sig[i] == 1 and sig[i + 1] == 0:
-            start = i + 1
-            bits = [int(sig[start + c]) for c in centre]
-            if bits[0]:  # high again at the start-bit centre: a glitch, not a frame
-                i += 1
-                continue
-            data = bits[1:1 + data_bits]
-            value = sum(b << k for k, b in enumerate(data))
-            parity_error = False
-            if parity_bits:
-                expected = 1 if parity == "odd" else 0
-                parity_error = (sum(data) + bits[1 + data_bits]) % 2 != expected
-            if detail:
-                result.append({"value": value, "start": start, "end": start + span,
-                               "time_s": _seconds(start, sample_rate),
-                               "framing_error": not all(bits[-stop_bits:]),
-                               "parity_error": parity_error})
-            else:
-                result.append(value)
-            # resume at the last stop-bit centre so back-to-back frames tolerate baud error
-            i = start - 1 + centre[-1]
+    # Only falling edges can begin a frame, so scan edges instead of samples.
+    starts = (np.flatnonzero(np.diff(sig.astype(np.int8)) == -1) + 1).tolist()
+    limit = len(sig) - span - 1
+    resume = 0
+    for start in starts:
+        if start > limit:
+            break
+        if start <= resume:
+            continue
+        bits = [int(sig[start + c]) for c in centre]
+        if bits[0]:  # high again at the start-bit centre: a glitch, not a frame
+            continue
+        data = bits[1:1 + data_bits]
+        value = sum(b << k for k, b in enumerate(data))
+        parity_error = False
+        if parity_bits:
+            expected = 1 if parity == "odd" else 0
+            parity_error = (sum(data) + bits[1 + data_bits]) % 2 != expected
+        if detail:
+            result.append({"value": value, "start": start, "end": start + span,
+                           "time_s": _seconds(start, sample_rate),
+                           "framing_error": not all(bits[-stop_bits:]),
+                           "parity_error": parity_error})
         else:
-            i += 1
+            result.append(value)
+        # resume at the last stop-bit centre so back-to-back frames tolerate baud error
+        resume = start - 1 + centre[-1]
     return result
 
 
@@ -408,7 +413,9 @@ def decode_i2c(samples, sda_ch, scl_ch, *, sample_rate=None, detail=False):
     scl = (samples >> scl_ch) & 1
     txns, cur = [], None
     bval, bcnt = 0, 0
-    for i in range(1, len(sda)):
+    # START, STOP and data bits all happen when SCL or SDA changes; skip idle samples.
+    events = np.flatnonzero((scl[1:] != scl[:-1]) | (sda[1:] != sda[:-1])) + 1
+    for i in events.tolist():
         if scl[i] == 1 and sda[i - 1] == 1 and sda[i] == 0:  # START
             if cur and cur['rw'] != '?':
                 cur['end'] = i  # ended by a repeated START
@@ -529,6 +536,8 @@ def _print_decoded(protocol, frames):
 def _cli(args):
     if (args.scan or args.prime) and (args.decode or args.save):
         raise ValueError("--decode and --save cannot be used with --scan or --prime")
+    if args.min_edges < 0:
+        raise ValueError("--min-edges must be 0 or more")
     _validate_decode_args(args)
     la = LogicAnalyzer(channels=args.channels)
     if args.scan:
@@ -577,7 +586,8 @@ def _cli(args):
             duration_ms = args.time if not args.input else round(len(data) * 1000 / rate, 3)
             result = {"ok": True, "sample_rate": rate, "duration_ms": duration_ms,
                       "samples": int(len(data)),
-                      "active_channels": la.summary(data, sample_rate=rate)}
+                      "active_channels": la.summary(data, sample_rate=rate,
+                                                    min_edges=args.min_edges)}
             if args.input:
                 result["input"] = args.input
             if args.save:
@@ -609,6 +619,9 @@ def main(argv=None):
                    help="capture length in ms (default: 200; ignored with --input)")
     p.add_argument("--channels", type=int, choices=(16, 32), default=32,
                    help="channel count of the device (default: 32)")
+    p.add_argument("--min-edges", type=int, default=2, metavar="N",
+                   help="summarise channels with more than N edges "
+                        "(default: 2; 0 includes one-shot signals)")
     p.add_argument("--trigger", metavar="SPEC",
                    help='pxlobster trigger spec, e.g. "0=r" for a CH0 rising edge')
     p.add_argument("--timeout", type=float, metavar="S",

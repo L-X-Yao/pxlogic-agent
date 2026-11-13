@@ -394,6 +394,17 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual([m["channel"] for m in active], [0, 7])
         self.assertAlmostEqual(active[1]["freq_hz"], 1000.0, places=6)
 
+    def test_summary_min_edges_includes_one_shot_channels(self):
+        sig = np.zeros(1_000, dtype=np.uint32)
+        sig[500:] = 1  # a single rising edge
+        samples = pack({2: sig})
+        with contextlib.redirect_stdout(io.StringIO()):
+            default = self.la.summary(samples, sample_rate=1_000_000)
+            one_shot = self.la.summary(samples, sample_rate=1_000_000, min_edges=0)
+        self.assertEqual(default, [])
+        self.assertEqual([m["channel"] for m in one_shot], [2])
+        self.assertEqual(one_shot[0]["edges"], 1)
+
     def test_nearest_rate(self):
         self.assertEqual(self.la.nearest_rate(19_000_000), 20_000_000)
         self.assertEqual(self.la.nearest_rate(1.2e9), 1_000_000_000)
@@ -495,6 +506,19 @@ class CliDecodeTest(unittest.TestCase):
         data = load_capture(path, channels=16)
         self.assertEqual(data.dtype, np.uint32)
         self.assertEqual(data.tolist(), [1, 0x8000])
+
+    def test_min_edges_includes_one_shot_channel(self):
+        sig = np.zeros(1_000, dtype=np.uint32)
+        sig[500:] = 1
+        path = self.write(pack({3: sig}))
+        code, out, err = self.run_main(["--json", "--input", path, "--rate", "1e6"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["active_channels"], [])
+        code, out, err = self.run_main(["--json", "--input", path, "--rate", "1e6",
+                                        "--min-edges", "0"])
+        self.assertEqual(code, 0, err)
+        [active] = json.loads(out)["active_channels"]
+        self.assertEqual((active["channel"], active["edges"]), (3, 1))
 
 
 if __name__ == "__main__":
