@@ -10,7 +10,7 @@ description: 用 PX Logic 逻辑分析仪采集和分析数字信号：测 PWM �
 ## 步骤
 
 1. 确认设备在线：`pxlogic-agent --json --scan`，`ok` 为 true 才继续。
-2. 测频率、占空比、脉宽：`pxlogic-agent --json --rate <Hz> --time <ms>`，读 stdout 的 JSON 里的 `active_channels`（`high_us` 是高电平脉宽，单位 µs），不要解析日志。单次跳变加 `--min-edges 0`，否则默认只列边沿数大于 2 的通道。
+2. 测频率、占空比、脉宽：`pxlogic-agent --json --rate <Hz> --time <ms>`，读 stdout 的 JSON 里的 `active_channels`（`high_us` 是高电平脉宽，单位 µs），不要解析日志。单次跳变加 `--min-edges 0`，否则默认只列边沿数大于 2 的通道。不知道协议时先跑 `--check`，读 `channels`、`buses` 的候选和置信度。
 3. 等触发：加 `--trigger "0=r"`（CH0 上升沿）和 `--timeout <秒>`；超时后会自动发送 `--stop`。
 4. 解码优先用命令行，读 JSON 的 `frames`；采集时加 `--save`，之后可用 `--input` 离线分析：
 
@@ -43,6 +43,7 @@ pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=
 - 采样率至少取被测信号最高频率的 10 倍；解 UART 时至少取波特率的 10 倍。测脉宽时分辨率是一个采样周期，舵机、电调 PWM 至少用 1 MHz。
 - 采样点数等于采样率乘时长，32 通道每点 4 字节；单次尽量不超过 5000 万点（约 200 MB）。
 - UART 支持 5–9 位数据、无 / 奇 / 偶校验、1 或 2 个停止位和反相（`invert=True`，如 SBUS）；SPI 支持 1–32 位字、MSB 或 LSB 先发，片选释放时重新对齐，`detail=True` 时 `bits` 小于 `word_bits` 的是残字；I2C 只支持 7 位地址。
+- `--check` 是确定性候选：UART 试 8N1、8E1 和 SBUS，SPI 按 8 位字，I2C 按 7 位地址；SPI 数据线不唯一时不猜 MOSI/MISO。确认后再用 `--decode` 指定参数。
 - 需要每帧的时间，或 UART 的校验、停止位错误时，解码函数加 `detail=True`；SPI、I2C 还要传 `sample_rate` 才有 `time_s`。
 - 找不到设备时：WSL 里先确认 Windows 侧执行过 `usbipd attach --wsl --busid <BUSID>`，再用 `lsusb` 查找 `16c0:05dc` 或 `1a86:5237`。
 - 需要中止正在进行的采集时，执行 `pxlobster --stop`。

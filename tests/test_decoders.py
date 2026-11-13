@@ -417,6 +417,60 @@ class AnalysisTest(unittest.TestCase):
         self.assertAlmostEqual(m["freq_hz"], 1_000.0)
 
 
+class IdentifyTest(unittest.TestCase):
+    def setUp(self):
+        self.la = LogicAnalyzer(exe_path="pxlobster")
+        self.rate = 20_000_000
+
+    def test_pwm(self):
+        t = np.arange(self.rate // 20)  # 50 ms
+        period = self.rate // 400
+        wave = (t % period) < period // 4  # 400 Hz, 25 % duty
+        result = self.la.identify(pack({0: wave}), self.rate)
+        [channel] = result["channels"]
+        best = channel["candidates"][0]
+        self.assertEqual(best["protocol"], "pwm")
+        self.assertAlmostEqual(best["freq_hz"], 400.0)
+        self.assertGreater(best["confidence"], 0.9)
+        self.assertEqual(result["buses"], [])
+
+    def test_uart(self):
+        wave = uart_wave(b"Hello, PX", 115_200, self.rate)
+        result = self.la.identify(pack({5: wave}), self.rate)
+        [channel] = result["channels"]
+        uart = [c for c in channel["candidates"] if c["protocol"] == "uart"][0]
+        self.assertEqual((uart["baudrate"], uart["parity"], uart["stop_bits"],
+                          uart["invert"]), (115200, "none", 1, False))
+        self.assertGreater(uart["confidence"], 0.8)
+
+    def test_sbus(self):
+        data = bytes([0x0F] + list(range(1, 23)) + [0, 0])
+        wave = uart_wave(data, 100_000, self.rate, gap_bits=0,
+                         parity="even", stop_bits=2, invert=True)
+        result = self.la.identify(pack({6: wave}), self.rate)
+        [channel] = result["channels"]
+        uart = [c for c in channel["candidates"] if c["protocol"] == "uart"][0]
+        self.assertEqual((uart["baudrate"], uart["parity"], uart["stop_bits"],
+                          uart["invert"]), (100000, "even", 2, True))
+
+    def test_i2c_bus(self):
+        scl, sda = i2c_wave([[(0x3C, "W", [0x00, 0xAF])]])
+        result = self.la.identify(pack({0: sda, 1: scl}), 1_000_000)
+        [bus] = [b for b in result["buses"] if b["protocol"] == "i2c"]
+        self.assertEqual((bus["sda"], bus["scl"], bus["addresses"]), (0, 1, [0x3C]))
+        self.assertGreaterEqual(bus["acks"], 2)
+
+    def test_spi_bus(self):
+        sclk, mosi, miso, cs = spi_wave(
+            [[(0xA5, 0x3C), (0x00, 0xFF)], [(0x81, 0x7E)]], 0)
+        result = self.la.identify(pack({2: sclk, 3: mosi, 4: miso, 5: cs}), 1_000_000)
+        [bus] = [b for b in result["buses"] if b["protocol"] == "spi"]
+        self.assertEqual((bus["sclk"], bus["cs"], bus["mode"]), (2, 5, 0))
+        self.assertEqual(bus["data"], [3, 4])
+        self.assertGreaterEqual(bus["words"], 2)
+        json.dumps(result)  # plain Python types only
+
+
 class CliDecodeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -519,6 +573,22 @@ class CliDecodeTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         [active] = json.loads(out)["active_channels"]
         self.assertEqual((active["channel"], active["edges"]), (3, 1))
+
+    def test_check_input_json(self):
+        path = self.write(pack({5: uart_wave(b"Hello", 115_200, 20_000_000)}))
+        code, out, err = self.run_main(["--json", "--input", path,
+                                        "--rate", "20e6", "--check"])
+        self.assertEqual(code, 0, err)
+        result = json.loads(out)
+        self.assertTrue(result["ok"])
+        [channel] = result["channels"]
+        self.assertEqual(channel["candidates"][0]["protocol"], "uart")
+        self.assertEqual(channel["candidates"][0]["baudrate"], 115200)
+
+    def test_check_rejects_decode(self):
+        code, out, _ = self.run_main(["--json", "--check", "--decode", "uart"])
+        self.assertEqual(code, 1)
+        self.assertIn("--check", json.loads(out)["error"])
 
 
 if __name__ == "__main__":

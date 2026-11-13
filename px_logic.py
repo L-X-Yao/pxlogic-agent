@@ -260,6 +260,39 @@ class LogicAnalyzer:
                 active.append(m)
         return active
 
+    def identify(self, samples, sample_rate=20_000_000, max_buses=4):
+        """Return deterministic channel stats and protocol/bus candidates.
+
+        Each active channel has a ``candidates`` list (pwm, uart) sorted by
+        confidence. ``buses`` holds i2c and spi candidates found across
+        channels. Candidates carry evidence such as frame counts, errors and
+        channel numbers; this method does not diagnose or prescribe.
+        """
+        channels = _identify_channels(self, samples, sample_rate)
+        buses = _identify_buses(samples, channels, sample_rate)
+        buses.sort(key=lambda b: b["confidence"], reverse=True)
+        buses = buses[:max_buses]
+        clock_channels, silent_channels = set(), set()
+        for bus in buses:
+            if bus["protocol"] == "i2c":
+                clock_channels.add(bus["scl"])
+                silent_channels.add(bus["sda"])
+                involved = (bus["sda"], bus["scl"])
+            else:
+                clock_channels.add(bus["sclk"])
+                silent_channels.update((bus["cs"], *bus["data"]))
+                involved = (bus["sclk"], bus["cs"], *bus["data"])
+            for ch in channels:
+                if ch["channel"] in involved and "bus" not in ch:
+                    ch["bus"] = bus["protocol"]
+        for ch in channels:
+            if ch["channel"] in silent_channels:
+                ch["candidates"] = []
+            elif ch["channel"] in clock_channels:
+                # A clock can look like UART or PWM; the bus evidence wins.
+                ch["candidates"] = [c for c in ch["candidates"] if c["protocol"] == "pwm"]
+        return {"channels": channels, "buses": buses}
+
 
 # ═══════════════════════════════════
 # Protocol decoders
@@ -451,6 +484,283 @@ def decode_i2c(samples, sda_ch, scl_ch, *, sample_rate=None, detail=False):
 
 
 # ═══════════════════════════════════
+# Protocol identification
+# ═══════════════════════════════════
+
+_UART_BAUDS = sorted({
+    300, 600, 1200, 2400, 4800, 9600, 14400, 19200, 28800, 38400,
+    57600, 76800, 115200, 230400, 250000, 460800, 500000, 921600,
+    1_000_000, 1_500_000, 2_000_000, 3_000_000, 31_250, 100_000, 420_000,
+})
+
+_UART_CONFIGS = [
+    (8, "none", 1, False),
+    (8, "even", 2, True),   # SBUS
+    (8, "even", 1, False),
+    (8, "odd", 1, False),
+    (8, "none", 2, False),
+    (8, "none", 1, True),
+    (7, "none", 1, False),
+]
+
+
+def _signal_runs(sig):
+    """Lengths of consecutive equal-level runs."""
+    diff = np.diff(sig.astype(np.int8))
+    edges = np.flatnonzero(diff != 0)
+    starts = np.r_[0, edges + 1]
+    ends = np.r_[edges + 1, len(sig)]
+    return ends - starts
+
+
+def _uart_baud_candidates(sig, sample_rate):
+    """Baud rates worth trying, starting near the shortest run length."""
+    runs = _signal_runs(sig)
+    runs = runs[runs >= 2]
+    estimate = sample_rate / float(runs.min()) if len(runs) else None
+    candidates = set()
+    if estimate:
+        nearest = min(_UART_BAUDS, key=lambda b: abs(b - estimate))
+        if abs(nearest - estimate) / estimate <= 0.02:
+            estimate = float(nearest)
+        for factor in (1.0, 0.5, 2.0, 3.0):
+            candidates.add(estimate * factor)
+        for baud in _UART_BAUDS:
+            if abs(baud - estimate) / estimate <= 0.25:
+                candidates.add(float(baud))
+    else:
+        candidates.update(float(b) for b in _UART_BAUDS)
+    valid = [b for b in candidates if b > 0 and sample_rate / b >= 4]
+    valid.sort(key=lambda b: abs(b - (estimate or b)))
+    return valid[:5]
+
+
+def _pwm_candidate(stats):
+    if stats["edges"] < 4 or stats["freq_hz"] <= 0 or stats["jitter_pct"] > 10:
+        return None
+    confidence = 0.5
+    if stats["edges"] >= 10:
+        confidence += 0.2
+    if stats["jitter_pct"] <= 1:
+        confidence += 0.2
+    if stats["high_us"] > 0:
+        confidence += 0.1
+    return {
+        "protocol": "pwm",
+        "confidence": round(min(1.0, confidence), 3),
+        "freq_hz": round(stats["freq_hz"], 3),
+        "duty_pct": round(stats["duty_pct"], 3),
+        "high_us": round(stats["high_us"], 3),
+        "jitter_pct": round(stats["jitter_pct"], 3),
+    }
+
+
+def _uart_candidate(samples, channel, sample_rate):
+    bauds = _uart_baud_candidates((samples >> channel) & 1, sample_rate)
+    duration = len(samples) / sample_rate if sample_rate else 0.0
+    # Cheap pass: count frames and require more than one distinct value. This
+    # rejects stable clocks and PWM without running the detailed decoder.
+    rough = []
+    for rank, baud in enumerate(bauds[:3]):
+        for data_bits, parity, stop_bits, invert in _UART_CONFIGS[:3]:
+            values = decode_uart(samples, channel, baud, sample_rate,
+                                 data_bits=data_bits, parity=parity,
+                                 stop_bits=stop_bits, invert=invert)
+            n = len(values)
+            if n < 2 or len(set(values)) < 2:
+                continue
+            rough.append((min(1.0, n / 5), rank, baud,
+                          (data_bits, parity, stop_bits, invert)))
+    if not rough:
+        return None
+    rough.sort(key=lambda item: (-item[0], item[1]))
+    best = None
+    for _, _, baud, config in rough[:2]:
+        data_bits, parity, stop_bits, invert = config
+        frames = decode_uart(samples, channel, baud, sample_rate,
+                             data_bits=data_bits, parity=parity,
+                             stop_bits=stop_bits, invert=invert, detail=True)
+        n = len(frames)
+        if n < 2 or len({f["value"] for f in frames}) < 2:
+            continue
+        framing = sum(1 for f in frames if f["framing_error"])
+        parity_errors = sum(1 for f in frames if f["parity_error"])
+        error_rate = (framing + parity_errors) / n
+        bits = 1 + data_bits + (0 if parity == "none" else 1) + stop_bits
+        expected = (baud / bits) * duration if duration else 0.0
+        coverage = n / expected if expected else 0.0
+        score = min(1.0, n / 5) * max(0.0, 1 - error_rate * 8)
+        if coverage > 1.05:
+            score *= 0.5
+        if score < 0.2:
+            continue
+        candidate = {
+            "protocol": "uart",
+            "confidence": round(score, 3),
+            "baudrate": int(baud) if float(baud).is_integer() else round(baud, 1),
+            "data_bits": data_bits,
+            "parity": parity,
+            "stop_bits": stop_bits,
+            "invert": invert,
+            "frames": n,
+            "framing_errors": framing,
+            "parity_errors": parity_errors,
+            "bytes_per_second": round(n / duration, 1) if duration else 0.0,
+        }
+        if best is None or candidate["confidence"] > best["confidence"]:
+            best = candidate
+    return best
+
+
+def _identify_channels(la, samples, sample_rate):
+    channels = []
+    if len(samples) > 1:
+        active_mask = int(np.bitwise_or.reduce(samples[1:] ^ samples[:-1]))
+    else:
+        active_mask = 0
+    for ch in range(la.channels):
+        if not (active_mask >> ch) & 1:
+            continue
+        stats = la.measure(samples, ch, sample_rate)
+        candidates = []
+        pwm = _pwm_candidate(stats)
+        if pwm:
+            candidates.append(pwm)
+        uart = _uart_candidate(samples, ch, sample_rate)
+        if uart:
+            candidates.append(uart)
+        candidates.sort(key=lambda c: c["confidence"], reverse=True)
+        stats["candidates"] = candidates
+        channels.append(stats)
+    return channels
+
+
+def _i2c_candidates(samples, channels, sample_rate):
+    active = [m for m in channels if m["edges"] > 0]
+    clock_like = [m for m in active
+                  if m["edges"] >= 6 and 10 <= m["duty_pct"] <= 90]
+    best = {}
+    for scl in clock_like:
+        for sda in active:
+            if sda["channel"] == scl["channel"]:
+                continue
+            txns = decode_i2c(samples, sda["channel"], scl["channel"], detail=True)
+            if not txns:
+                continue
+            total_acks = sum(len(t["acks"]) for t in txns)
+            if not total_acks:
+                continue
+            acks = sum(1 for t in txns for a in t["acks"] if a)
+            ack_ratio = acks / total_acks
+            if ack_ratio < 0.5:
+                continue
+            data_bytes = sum(len(t["data"]) for t in txns)
+            score = ((0.4 + 0.6 * ack_ratio) *
+                     (0.5 + 0.5 * min(1.0, (len(txns) + data_bytes) / 4)))
+            if score < 0.5:
+                continue
+            key = frozenset((sda["channel"], scl["channel"]))
+            candidate = {
+                "protocol": "i2c",
+                "confidence": round(score, 3),
+                "sda": sda["channel"],
+                "scl": scl["channel"],
+                "transactions": len(txns),
+                "acks": acks,
+                "nacks": total_acks - acks,
+                "addresses": sorted({t["addr"] for t in txns}),
+            }
+            if key not in best or score > best[key]["confidence"]:
+                best[key] = candidate
+    return sorted(best.values(), key=lambda b: b["confidence"], reverse=True)
+
+
+def _spi_candidates(samples, channels, sample_rate):
+    active = [m for m in channels if m["edges"] > 0]
+    clock_like = [m for m in active
+                  if m["edges"] >= 6 and 10 <= m["duty_pct"] <= 90]
+    best = {}
+    for clk in clock_like:
+        clk_ch = clk["channel"]
+        sclk = (samples >> clk_ch) & 1
+        clk_diff = np.diff(sclk.astype(np.int8))
+        all_edges = np.flatnonzero(clk_diff != 0) + 1
+        for cs in active:
+            cs_ch = cs["channel"]
+            if cs_ch == clk_ch:
+                continue
+            cs_sig = (samples >> cs_ch) & 1
+            cs_frames = int(np.count_nonzero(np.diff(cs_sig.astype(np.int8)) == -1))
+            if cs_frames < 1 or np.count_nonzero(cs_sig[all_edges] == 0) < 8:
+                continue
+            for mosi in active:
+                mosi_ch = mosi["channel"]
+                if mosi_ch in (clk_ch, cs_ch):
+                    continue
+                mosi_sig = (samples >> mosi_ch) & 1
+                mosi_diff = np.diff(mosi_sig.astype(np.int8))
+                if np.count_nonzero((mosi_diff != 0) & (cs_sig[1:] == 0)) < 4:
+                    continue
+                for mode in range(4):
+                    cpol, cpha = mode >> 1, mode & 1
+                    edge = 1 if (cpol == 0) != (cpha == 1) else -1
+                    sample_edges = np.flatnonzero(clk_diff == edge) + 1
+                    active_edges = sample_edges[cs_sig[sample_edges] == 0]
+                    if len(active_edges) < 8:
+                        continue
+                    words = decode_spi(samples, clk_ch, mosi_ch, None, cs_ch,
+                                       cpol=cpol, cpha=cpha, detail=True)
+                    complete = sum(1 for w in words if w["bits"] == 8)
+                    if complete < 2:
+                        continue
+                    violations = np.count_nonzero(
+                        mosi_sig[active_edges] != mosi_sig[active_edges - 1]) / len(active_edges)
+                    score = (min(1.0, complete / 4) *
+                             (0.6 + 0.4 * min(1.0, cs_frames / 2)) *
+                             max(0.0, 1 - violations * 4))
+                    if score < 0.4:
+                        continue
+                    key = (clk_ch, cs_ch, mosi_ch)
+                    candidate = {
+                        "protocol": "spi",
+                        "confidence": float(round(score, 3)),
+                        "sclk": clk_ch,
+                        "mosi": mosi_ch,
+                        "miso": None,
+                        "cs": cs_ch,
+                        "mode": mode,
+                        "words": complete,
+                        "frames": cs_frames,
+                    }
+                    if key not in best or score > best[key]["confidence"]:
+                        best[key] = candidate
+    grouped = {}
+    for candidate in best.values():
+        grouped.setdefault((candidate["sclk"], candidate["cs"], candidate["mode"]),
+                           []).append(candidate)
+    result = []
+    for candidates in grouped.values():
+        data = sorted({c["mosi"] for c in candidates})
+        top = max(candidates, key=lambda c: c["confidence"])
+        item = {k: v for k, v in top.items() if k != "mosi"}
+        item["data"] = data
+        item["mosi"] = data[0] if len(data) == 1 else None
+        item["miso"] = None
+        if len(data) > 1:
+            item["ambiguous_data"] = True
+        result.append(item)
+    return sorted(result, key=lambda b: b["confidence"], reverse=True)
+
+
+def _identify_buses(samples, channels, sample_rate):
+    active = sorted((m for m in channels if m["edges"] > 0),
+                    key=lambda m: m["edges"], reverse=True)[:8]
+    buses = _i2c_candidates(samples, active, sample_rate)
+    buses.extend(_spi_candidates(samples, active, sample_rate))
+    return buses
+
+
+# ═══════════════════════════════════
 # Command line
 # ═══════════════════════════════════
 
@@ -533,9 +843,47 @@ def _print_decoded(protocol, frames):
             print(f"{ts}  {f['rw']} 0x{f['addr']:02X}: {data}  [{acks}]")
 
 
+def _print_check(result):
+    for ch in result["channels"]:
+        if ch.get("bus"):
+            continue
+        candidates = ch["candidates"]
+        if not candidates:
+            print(f"CH{ch['channel']:02d}: {ch['edges']} edges, no protocol candidate")
+            continue
+        best = candidates[0]
+        if best["protocol"] == "uart":
+            parity = "N" if best["parity"] == "none" else best["parity"][0].upper()
+            inverted = " inverted" if best["invert"] else ""
+            errors = best["framing_errors"] + best["parity_errors"]
+            print(f"CH{ch['channel']:02d}: UART {best['baudrate']:g} "
+                  f"{best['data_bits']}{parity}{best['stop_bits']}{inverted}  "
+                  f"conf {best['confidence']:.2f}  frames {best['frames']}  errors {errors}")
+        else:
+            print(f"CH{ch['channel']:02d}: PWM {best['freq_hz']:,.1f} Hz  "
+                  f"{best['duty_pct']:.1f}%  high {best['high_us']:.2f} us  "
+                  f"conf {best['confidence']:.2f}")
+    for bus in result["buses"]:
+        if bus["protocol"] == "i2c":
+            print(f"I2C: SDA=CH{bus['sda']} SCL=CH{bus['scl']}  "
+                  f"{bus['transactions']} txns  {bus['acks']} ACK  "
+                  f"conf {bus['confidence']:.2f}")
+        elif bus["mosi"] is not None:
+            print(f"SPI: SCLK=CH{bus['sclk']} MOSI=CH{bus['mosi']} CS=CH{bus['cs']}  "
+                  f"mode {bus['mode']}  {bus['words']} words  "
+                  f"conf {bus['confidence']:.2f}")
+        else:
+            data = ",".join(f"CH{ch}" for ch in bus["data"])
+            print(f"SPI: SCLK=CH{bus['sclk']} DATA={data} CS=CH{bus['cs']}  "
+                  f"mode {bus['mode']}  {bus['words']} words  "
+                  f"conf {bus['confidence']:.2f}")
+
+
 def _cli(args):
-    if (args.scan or args.prime) and (args.decode or args.save):
-        raise ValueError("--decode and --save cannot be used with --scan or --prime")
+    if (args.scan or args.prime) and (args.decode or args.save or args.check):
+        raise ValueError("--decode, --save and --check cannot be used with --scan or --prime")
+    if args.check and args.decode:
+        raise ValueError("--check cannot be combined with --decode")
     if args.min_edges < 0:
         raise ValueError("--min-edges must be 0 or more")
     _validate_decode_args(args)
@@ -582,6 +930,18 @@ def _cli(args):
                 if result["truncated"]:
                     print(f"[LA] showing first {len(result['frames'])} of "
                           f"{result['count']} frames", file=sys.stderr)
+        elif args.check:
+            result = la.identify(data, sample_rate=rate)
+            result["ok"] = True
+            result["sample_rate"] = rate
+            result["samples"] = int(len(data))
+            result["duration_ms"] = round(len(data) * 1000 / rate, 3)
+            if args.input:
+                result["input"] = args.input
+            if args.save:
+                result["saved"] = args.save
+            if not args.json:
+                _print_check(result)
         else:
             duration_ms = args.time if not args.input else round(len(data) * 1000 / rate, 3)
             result = {"ok": True, "sample_rate": rate, "duration_ms": duration_ms,
@@ -607,7 +967,7 @@ def main(argv=None):
 
     p = argparse.ArgumentParser(
         description="Capture with a PX Logic analyzer through pxlobster, "
-                    "summarise channels or decode a protocol.")
+                    "summarise channels, decode or identify protocols.")
     action = p.add_mutually_exclusive_group()
     action.add_argument("--scan", action="store_true", help="list supported devices and exit")
     action.add_argument("--prime", action="store_true", help="load the FPGA bitstream and exit")
@@ -631,6 +991,8 @@ def main(argv=None):
                    help="save the raw capture to FILE (packed .bin)")
     p.add_argument("--decode", choices=("uart", "spi", "i2c"),
                    help="decode a protocol instead of only summarising channels")
+    p.add_argument("--check", action="store_true",
+                   help="identify protocols and buses on active channels")
     p.add_argument("--detail", action="store_true",
                    help="include positions, times and error flags in decoded frames")
     p.add_argument("--limit", type=int, default=10000, metavar="N",

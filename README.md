@@ -100,7 +100,7 @@ pxlogic-agent --rate 20e6 --time 200   # 采集 200 ms，打印各活动通道�
 
 ### 命令行（JSON 输出）
 
-`pxlogic-agent` 采集一段数据，汇总每个活动通道；加 `--decode` 时改为解码协议。加 `--json` 后，stdout 只输出一个 JSON 对象，日志全部转到 stderr。成功时退出码为 0，失败时为 1。
+`pxlogic-agent` 采集一段数据，汇总每个活动通道；加 `--check` 时自动识别协议和总线，加 `--decode` 时按指定协议解码。加 `--json` 后，stdout 只输出一个 JSON 对象，日志全部转到 stderr。成功时退出码为 0，失败时为 1。
 
 ```bash
 pxlogic-agent --json --rate 20e6 --time 200
@@ -130,6 +130,7 @@ pxlogic-agent --json --rate 20e6 --time 200
 | `--min-edges` | 汇总边沿数大于 N 的通道，默认 2；0 可看到单边沿信号 |
 | `--trigger` | 触发条件，如 `0=r`（CH0 上升沿），语法同 pxlobster 的 `-t` |
 | `--timeout` | 最长等待秒数，超时后自动发送 `--stop`，默认 max(30, 5 × 时长 + 10) |
+| `--check` | 自动识别每个活动通道的协议和总线，结果在 `channels`、`buses` 里 |
 | `--decode` | 解码 `uart`、`spi` 或 `i2c`，结果在 JSON 的 `frames` 里 |
 | `--detail` | 解码结果带采样位置、`time_s` 和错误标志 |
 | `--limit` | 最多返回多少条解码结果，0 为不限，默认 10000 |
@@ -144,6 +145,10 @@ pxlogic-agent --json --rate 20e6 --time 200
 | I2C | `--sda`、`--scl` |
 
 ```bash
+# 不知道接的是什么：自动识别每个活动通道
+pxlogic-agent --json --rate 20e6 --time 200 --check
+pxlogic-agent --json --input cap.bin --rate 20e6 --check
+
 # 采集 200 ms，解码 CH5 上的 115200 8N1 串口
 pxlogic-agent --json --rate 20e6 --time 200 --decode uart --channel 5 --baud 115200
 
@@ -156,6 +161,20 @@ pxlogic-agent --json --input cap.bin --rate 20e6 --decode uart \
 pxlogic-agent --json --input cap.bin --rate 20e6 --decode spi \
   --sclk 2 --mosi 3 --miso 4 --cs 5 --word-bits 16
 ```
+
+`--check` 的 JSON 形如：
+
+```json
+{"ok": true, "sample_rate": 20000000, "samples": 4000000, "duration_ms": 200.0,
+ "channels": [{"channel": 5, "edges": 54, "freq_hz": 29656.7, "duty_pct": 54.4,
+               "candidates": [{"protocol": "uart", "confidence": 1.0, "baudrate": 115200,
+                               "data_bits": 8, "parity": "none", "stop_bits": 1,
+                               "invert": false, "frames": 9, "framing_errors": 0,
+                               "parity_errors": 0}]}],
+ "buses": []}
+```
+
+`--check` 只给候选和证据，不给诊断。UART 会尝试 8N1、8E1 和 SBUS（8E2 反相）；SPI 报告 SCLK、CS 和数据线，数据线不唯一时不猜 MOSI/MISO；I2C 报告 SDA/SCL、地址和 ACK 数。确认协议后再用 `--decode` 指定参数。
 
 解码结果的 JSON 形如：
 
@@ -181,6 +200,7 @@ data = la.capture(rate=rate, duration_ms=100, save_path="cap.bin")  # 可选：�
 m = la.measure(data, channel=0, sample_rate=rate)   # 键同上文 JSON 里 active_channels 的元素
 active = la.summary(data, sample_rate=rate)         # 默认只列边沿数大于 2 的通道
 active = la.summary(data, sample_rate=rate, min_edges=0)  # 也列出单边沿通道
+found = la.identify(data, sample_rate=rate)         # 协议/总线候选，不诊断
 
 print(bytes(decode_uart(data, channel=5, baudrate=115200, sample_rate=rate)))
 
@@ -197,7 +217,7 @@ pairs = decode_spi(data, sclk_ch=2, mosi_ch=3, miso_ch=4, cs_ch=5, cpol=0, cpha=
                    word_bits=16, lsb_first=False)  # [(mosi, miso), ...]
 ```
 
-`capture()` 还接受 `mode`（`"buffer"` 或 `"stream"`；loop 模式会一直运行到被停止，`capture()` 直接报错，需要时请直接运行 pxlobster，再用 `--stop` 结束）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）、`timeout_s` 和 `save_path`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。`summary()` 默认只列边沿数大于 2 的通道；`min_edges=0` 可看到复位、使能这类单次跳变。
+`capture()` 还接受 `mode`（`"buffer"` 或 `"stream"`；loop 模式会一直运行到被停止，`capture()` 直接报错，需要时请直接运行 pxlobster，再用 `--stop` 结束）、`triggers`（如 `"0=r"`，表示 CH0 上升沿）、`timeout_s` 和 `save_path`。等待超时会自动发送 `--stop`。采集失败或超时都返回空数组，原因在 `la.last_error`。`la.prime()` 可提前加载位流，只有设备报告加载成功时才返回 True。`measure_frequency()` 仍然可用，只返回频率。`summary()` 默认只列边沿数大于 2 的通道；`min_edges=0` 可看到复位、使能这类单次跳变。`identify()` 返回 `channels` 和 `buses`，每个候选带 `confidence` 和帧数/错误等证据，不做诊断。
 
 三个解码器都接受 `detail=True`，每条结果变成字典，多出 `start`、`end`（采样序号）和 `time_s`（秒）。UART 还有 `framing_error`（停止位为低）和 `parity_error`；不加 `detail` 时不报告这两种错误，数据照常返回。SPI 还有 `bits`，小于 `word_bits` 表示片选释放时不满一个字。SPI、I2C 要同时传 `sample_rate` 才有 `time_s`，否则为 None。I2C 的 `end` 是 STOP 或重复起始的位置，采集结束前没等到时为 None。
 
