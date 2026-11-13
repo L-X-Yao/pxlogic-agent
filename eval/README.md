@@ -20,7 +20,7 @@ python3 eval/runner.py --case spi
 
 跑分器会生成 capture，调用 `identify()`，逐项核对期望，输出通过数和失败原因。退出码为 0 表示全部通过。
 
-当前 `cases/smoke.json` 有 13 个用例：PWM、舵机 PWM、UART、UART 帧错误、UART 校验错误、SBUS、I2C 写、I2C 读、SPI mode 0/3、空闲、噪声。
+当前 `cases/smoke.json` 有 15 个用例：PWM、PWM 抖动、舵机 PWM、UART、UART 帧错误、UART 校验错误、SBUS、I2C 写、I2C NACK、I2C 读、SPI mode 0/3、空闲、噪声。
 
 加用例时优先加**合成故障**：错误波特率、错误 SPI 模式、I2C NACK、PWM 抖动、总线卡死。真实 capture 到位后再补，文件要小并脱敏。
 

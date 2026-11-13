@@ -271,14 +271,14 @@ USB 2.0 连接下，高采样率受带宽限制。
 python3 -m unittest discover -s tests -v
 ```
 
-`eval/` 是离线评测集，用 13 个合成故障检查 `identify`/`--check` 的协议和总线识别，不需要硬件：
+`eval/` 是离线评测集，用 15 个合成故障检查 `identify`/`--check` 的协议和总线识别，不需要硬件：
 
 ```bash
 python3 eval/runner.py
 python3 eval/runner.py --json
 ```
 
-用例格式和新增方式见 [eval/README.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/eval/README.md)。
+用例格式和新增方式见 [eval/README.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/eval/README.md)。设备回归清单见 [docs/REGRESSION.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/docs/REGRESSION.md)，发布步骤见 [docs/RELEASE.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/docs/RELEASE.md)。
 
 ## 致谢
 

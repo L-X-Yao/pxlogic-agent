@@ -52,7 +52,7 @@ def _check_channel(result, expected, failures):
         if key in ("channel", "protocol", "min_confidence", "min_frames",
                    "max_framing_errors", "max_parity_errors",
                    "min_framing_errors", "min_parity_errors",
-                   "freq_tol", "duty_tol", "high_tol"):
+                   "min_jitter_pct", "freq_tol", "duty_tol", "high_tol"):
             continue
         actual_value = candidate.get(key)
         if isinstance(expected_value, (int, float)) and isinstance(actual_value, (int, float)):
@@ -91,6 +91,11 @@ def _check_channel(result, expected, failures):
             failures.append(
                 f"CH{channel}: parity_errors {candidate.get('parity_errors')} < "
                 f"{expected['min_parity_errors']}")
+    if "min_jitter_pct" in expected:
+        if candidate.get("jitter_pct", 0) < expected["min_jitter_pct"]:
+            failures.append(
+                f"CH{channel}: jitter_pct {candidate.get('jitter_pct')} < "
+                f"{expected['min_jitter_pct']}")
 
 
 def _matches_bus(actual, expected):

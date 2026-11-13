@@ -17,6 +17,25 @@
       }
     },
     {
+      "name": "pwm_400hz_jitter",
+      "kind": "pwm",
+      "sample_rate": 1000000,
+      "channel": 2,
+      "freq_hz": 400,
+      "duty_pct": 25,
+      "duration_ms": 200,
+      "jitter_pct": 3,
+      "seed": 5,
+      "expected": {
+        "channels": [
+          {"channel": 2, "protocol": "pwm", "freq_hz": 400, "freq_tol": 4,
+           "duty_pct": 25, "duty_tol": 2, "min_jitter_pct": 1,
+           "min_confidence": 0.7}
+        ],
+        "buses": []
+      }
+    },
+    {
       "name": "pwm_servo_50hz_1500us",
       "kind": "pwm",
       "sample_rate": 1000000,
@@ -150,6 +169,24 @@
         "buses": [
           {"protocol": "i2c", "sda": 0, "scl": 1, "min_confidence": 0.6,
            "min_acks": 2, "addresses": [60]}
+        ]
+      }
+    },
+    {
+      "name": "i2c_write_nack",
+      "kind": "i2c",
+      "sample_rate": 1000000,
+      "sda": 0,
+      "scl": 1,
+      "messages": [
+        [[60, "W", [0, 175]]]
+      ],
+      "nack_last": true,
+      "expected": {
+        "channels": [],
+        "buses": [
+          {"protocol": "i2c", "sda": 0, "scl": 1, "min_confidence": 0.5,
+           "min_acks": 1, "min_nacks": 1, "addresses": [60]}
         ]
       }
     },

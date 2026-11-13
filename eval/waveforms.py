@@ -74,7 +74,7 @@ def spi(frames, mode, half=6):
     return sclk, mosi, miso, cs
 
 
-def i2c(messages, half=8):
+def i2c(messages, half=8, nack_last=False):
     """One list of (addr7, "R"|"W", data) parts per START..STOP."""
     scl, sda = [], []
     q = half // 2
@@ -101,6 +101,8 @@ def i2c(messages, half=8):
                 for bit in range(7, -1, -1):
                     clock_bit((byte >> bit) & 1)
                 nack = rw == "R" and j > 0 and j == len(frame) - 1
+                if nack_last and rw == "W" and j == len(frame) - 1:
+                    nack = True
                 clock_bit(1 if nack else 0)
         emit(q, 0, sda[-1])
         emit(q, 0, 0)
@@ -110,11 +112,23 @@ def i2c(messages, half=8):
     return scl, sda
 
 
-def pwm(sample_rate, duration_ms, freq_hz, duty_pct):
+def pwm(sample_rate, duration_ms, freq_hz, duty_pct, jitter_pct=0.0, seed=0):
     n = int(sample_rate * duration_ms / 1000)
     period = sample_rate / float(freq_hz)
-    t = np.arange(n)
-    return ((t % period) < period * duty_pct / 100).astype(np.uint32)
+    if not jitter_pct:
+        t = np.arange(n)
+        return ((t % period) < period * duty_pct / 100).astype(np.uint32)
+    rng = np.random.default_rng(seed)
+    wave = np.zeros(n, dtype=np.uint32)
+    jitter = period * jitter_pct / 100
+    t = 0
+    while t < n:
+        period_i = max(1.0, period + rng.uniform(-jitter, jitter))
+        high = max(1, min(n - t, int(period_i * duty_pct / 100)))
+        low = max(1, int(period_i - high))
+        wave[t:t + high] = 1
+        t += high + low
+    return wave
 
 
 def build(case):
@@ -141,10 +155,12 @@ def build(case):
             channels[case["miso"]] = miso
         return pack(channels), rate
     if kind == "i2c":
-        scl, sda = i2c(case["messages"], half=case.get("half", 8))
+        scl, sda = i2c(case["messages"], half=case.get("half", 8),
+                       nack_last=case.get("nack_last", False))
         return pack({case["sda"]: sda, case["scl"]: scl}), rate
     if kind == "pwm":
-        wave = pwm(rate, case["duration_ms"], case["freq_hz"], case["duty_pct"])
+        wave = pwm(rate, case["duration_ms"], case["freq_hz"], case["duty_pct"],
+                   jitter_pct=case.get("jitter_pct", 0.0), seed=case.get("seed", 0))
         return pack({case["channel"]: wave}), rate
     if kind == "idle":
         n = int(rate * case["duration_ms"] / 1000)
