@@ -14,7 +14,7 @@ A PX Logic logic-analyzer toolkit for AI agents: capture, frequency measurement 
 2. 在本仓库目录启动 Claude Code，它会自动读取 [CLAUDE.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/CLAUDE.md) 里的操作约定。
 3. 直接描述需求，例如“CH0 接了 PWM，测一下频率和占空比”，或“CH5 是 115200 的串口，抓 200 ms 解出内容”。代理会调用 `pxlogic-agent --json` 或 Python API 完成采集和解码。
 
-在其他项目里用：pip 安装后，把仓库里的 `skills/pxlogic` 目录复制到 `~/.claude/skills/`，Claude Code 在任何项目里遇到相关需求都会加载它。
+在其他项目里用：pip 安装后，把仓库里的 `skills/pxlogic` 目录复制到 `~/.claude/skills/`，Claude Code 在任何项目里遇到相关需求都会加载它。`skills/pxlogic-diagnose` 是“先证据、再假设、再采集”的诊断流程，可以一起复制。
 
 Codex、Cursor 等代理读取 [AGENTS.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/AGENTS.md)。人也可以直接使用下文的命令行和 Python API。
 
@@ -270,6 +270,15 @@ USB 2.0 连接下，高采样率受带宽限制。
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+`eval/` 是离线评测集，用 13 个合成故障检查 `identify`/`--check` 的协议和总线识别，不需要硬件：
+
+```bash
+python3 eval/runner.py
+python3 eval/runner.py --json
+```
+
+用例格式和新增方式见 [eval/README.md](https://github.com/L-X-Yao/pxlogic-agent/blob/main/eval/README.md)。
 
 ## 致谢
 

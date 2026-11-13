@@ -589,7 +589,7 @@ def _uart_candidate(samples, channel, sample_rate):
         bits = 1 + data_bits + (0 if parity == "none" else 1) + stop_bits
         expected = (baud / bits) * duration if duration else 0.0
         coverage = n / expected if expected else 0.0
-        score = min(1.0, n / 5) * max(0.0, 1 - error_rate * 8)
+        score = min(1.0, n / 5) * max(0.0, 1 - error_rate * 2)
         if coverage > 1.05:
             score *= 0.5
         if score < 0.2:
@@ -648,13 +648,15 @@ def _i2c_candidates(samples, channels, sample_rate):
             if not txns:
                 continue
             total_acks = sum(len(t["acks"]) for t in txns)
-            if not total_acks:
-                continue
             acks = sum(1 for t in txns for a in t["acks"] if a)
+            data_bytes = sum(len(t["data"]) for t in txns)
+            if total_acks < 2 or data_bytes < 1:
+                continue
+            if not any(0 < t["addr"] < 0x7F for t in txns):
+                continue
             ack_ratio = acks / total_acks
             if ack_ratio < 0.5:
                 continue
-            data_bytes = sum(len(t["data"]) for t in txns)
             score = ((0.4 + 0.6 * ack_ratio) *
                      (0.5 + 0.5 * min(1.0, (len(txns) + data_bytes) / 4)))
             if score < 0.5:
@@ -693,6 +695,8 @@ def _spi_candidates(samples, channels, sample_rate):
             cs_frames = int(np.count_nonzero(np.diff(cs_sig.astype(np.int8)) == -1))
             if cs_frames < 1 or np.count_nonzero(cs_sig[all_edges] == 0) < 8:
                 continue
+            idle = sclk[cs_sig == 1]
+            idle_cpol = int(np.mean(idle) >= 0.5) if len(idle) else None
             for mosi in active:
                 mosi_ch = mosi["channel"]
                 if mosi_ch in (clk_ch, cs_ch):
@@ -703,6 +707,8 @@ def _spi_candidates(samples, channels, sample_rate):
                     continue
                 for mode in range(4):
                     cpol, cpha = mode >> 1, mode & 1
+                    if idle_cpol is not None and cpol != idle_cpol:
+                        continue
                     edge = 1 if (cpol == 0) != (cpha == 1) else -1
                     sample_edges = np.flatnonzero(clk_diff == edge) + 1
                     active_edges = sample_edges[cs_sig[sample_edges] == 0]

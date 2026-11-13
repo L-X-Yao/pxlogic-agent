@@ -1,0 +1,240 @@
+{
+  "cases": [
+    {
+      "name": "pwm_400hz_25pct",
+      "kind": "pwm",
+      "sample_rate": 1000000,
+      "channel": 0,
+      "freq_hz": 400,
+      "duty_pct": 25,
+      "duration_ms": 50,
+      "expected": {
+        "channels": [
+          {"channel": 0, "protocol": "pwm", "freq_hz": 400, "freq_tol": 1,
+           "duty_pct": 25, "duty_tol": 0.5, "min_confidence": 0.9}
+        ],
+        "buses": []
+      }
+    },
+    {
+      "name": "pwm_servo_50hz_1500us",
+      "kind": "pwm",
+      "sample_rate": 1000000,
+      "channel": 1,
+      "freq_hz": 50,
+      "duty_pct": 7.5,
+      "duration_ms": 200,
+      "expected": {
+        "channels": [
+          {"channel": 1, "protocol": "pwm", "freq_hz": 50, "freq_tol": 0.1,
+           "high_us": 1500, "high_tol": 2, "min_confidence": 0.9}
+        ],
+        "buses": []
+      }
+    },
+    {
+      "name": "uart_115200_text",
+      "kind": "uart",
+      "sample_rate": 20000000,
+      "channel": 5,
+      "data": "Hello, PX",
+      "baud": 115200,
+      "parity": "none",
+      "stop_bits": 1,
+      "invert": false,
+      "gap_bits": 2.0,
+      "expected": {
+        "channels": [
+          {"channel": 5, "protocol": "uart", "baudrate": 115200,
+           "parity": "none", "stop_bits": 1, "invert": false,
+           "min_confidence": 0.8, "min_frames": 5, "max_framing_errors": 0}
+        ],
+        "buses": []
+      }
+    },
+    {
+      "name": "uart_9600_text",
+      "kind": "uart",
+      "sample_rate": 20000000,
+      "channel": 7,
+      "data": "Hello",
+      "baud": 9600,
+      "parity": "none",
+      "stop_bits": 1,
+      "invert": false,
+      "gap_bits": 2.0,
+      "expected": {
+        "channels": [
+          {"channel": 7, "protocol": "uart", "baudrate": 9600,
+           "parity": "none", "stop_bits": 1, "invert": false,
+           "min_confidence": 0.8, "min_frames": 3}
+        ],
+        "buses": []
+      }
+    },
+    {
+      "name": "uart_framing_error",
+      "kind": "uart",
+      "sample_rate": 20000000,
+      "channel": 5,
+      "data": "Hello",
+      "baud": 115200,
+      "parity": "none",
+      "stop_bits": 1,
+      "invert": false,
+      "gap_bits": 2.0,
+      "bad_stop": [1],
+      "expected": {
+        "channels": [
+          {"channel": 5, "protocol": "uart", "baudrate": 115200,
+           "parity": "none", "stop_bits": 1, "invert": false,
+           "min_confidence": 0.5, "min_frames": 3,
+           "min_framing_errors": 1}
+        ],
+        "buses": []
+      }
+    },
+    {
+      "name": "uart_parity_error",
+      "kind": "uart",
+      "sample_rate": 20000000,
+      "channel": 5,
+      "data": "Hello",
+      "baud": 115200,
+      "parity": "even",
+      "stop_bits": 1,
+      "invert": false,
+      "gap_bits": 2.0,
+      "bad_parity": [1],
+      "expected": {
+        "channels": [
+          {"channel": 5, "protocol": "uart", "baudrate": 115200,
+           "parity": "even", "stop_bits": 1, "invert": false,
+           "min_confidence": 0.5, "min_frames": 3,
+           "min_parity_errors": 1}
+        ],
+        "buses": []
+      }
+    },
+    {
+      "name": "sbus_100k_8e2_inverted",
+      "kind": "uart",
+      "sample_rate": 20000000,
+      "channel": 6,
+      "data_hex": "0f0102030405060708090a0b0c0d0e0f101112131415160000",
+      "baud": 100000,
+      "parity": "even",
+      "stop_bits": 2,
+      "invert": true,
+      "gap_bits": 0.0,
+      "expected": {
+        "channels": [
+          {"channel": 6, "protocol": "uart", "baudrate": 100000,
+           "parity": "even", "stop_bits": 2, "invert": true,
+           "min_confidence": 0.8, "min_frames": 20}
+        ],
+        "buses": []
+      }
+    },
+    {
+      "name": "i2c_write",
+      "kind": "i2c",
+      "sample_rate": 1000000,
+      "sda": 0,
+      "scl": 1,
+      "messages": [
+        [[60, "W", [0, 175]]]
+      ],
+      "expected": {
+        "channels": [],
+        "buses": [
+          {"protocol": "i2c", "sda": 0, "scl": 1, "min_confidence": 0.6,
+           "min_acks": 2, "addresses": [60]}
+        ]
+      }
+    },
+    {
+      "name": "i2c_register_read",
+      "kind": "i2c",
+      "sample_rate": 1000000,
+      "sda": 0,
+      "scl": 1,
+      "messages": [
+        [[104, "W", [117]], [104, "R", [113, 0]]]
+      ],
+      "expected": {
+        "channels": [],
+        "buses": [
+          {"protocol": "i2c", "sda": 0, "scl": 1, "min_confidence": 0.6,
+           "min_acks": 4, "addresses": [104]}
+        ]
+      }
+    },
+    {
+      "name": "spi_mode0_8bit",
+      "kind": "spi",
+      "sample_rate": 1000000,
+      "sclk": 2,
+      "mosi": 3,
+      "miso": 4,
+      "cs": 5,
+      "mode": 0,
+      "frames": [
+        [[165, 60], [0, 255]],
+        [[129, 126]]
+      ],
+      "expected": {
+        "channels": [],
+        "buses": [
+          {"protocol": "spi", "sclk": 2, "cs": 5, "data": [3, 4],
+           "mode": 0, "min_confidence": 0.5, "min_words": 2}
+        ]
+      }
+    },
+    {
+      "name": "spi_mode3_8bit",
+      "kind": "spi",
+      "sample_rate": 1000000,
+      "sclk": 2,
+      "mosi": 3,
+      "miso": 4,
+      "cs": 5,
+      "mode": 3,
+      "frames": [
+        [[90, 195], [255, 0]],
+        [[126, 129]]
+      ],
+      "expected": {
+        "channels": [],
+        "buses": [
+          {"protocol": "spi", "sclk": 2, "cs": 5, "data": [3, 4],
+           "mode": 3, "min_confidence": 0.5, "min_words": 2}
+        ]
+      }
+    },
+    {
+      "name": "idle_line",
+      "kind": "idle",
+      "sample_rate": 1000000,
+      "duration_ms": 10,
+      "expected": {
+        "channels": [],
+        "buses": [],
+        "no_channels": true,
+        "no_buses": true
+      }
+    },
+    {
+      "name": "random_noise",
+      "kind": "noise",
+      "sample_rate": 1000000,
+      "duration_ms": 10,
+      "seed": 7,
+      "expected": {
+        "channels": [],
+        "buses": [],
+        "no_buses": true
+      }
+    }
+  ]
+}
